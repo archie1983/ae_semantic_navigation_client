@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ae_semantic_navigation_client"
+version = "0.1.0"
+description = "A semantic navigation client to connect to semantic navigation package running on a jetson."
+authors = [{ name = "Arturs Elksnis" }]
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "pyzmq",
+    "thortils",
+    "ai2thor",
+    "ai2-thor_model_training"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
