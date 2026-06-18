@@ -5,6 +5,7 @@ from thortils.utils.math import sep_spatial_sample
 import thortils as tt
 import random, cv2
 from PIL import Image
+import numpy as np
 
 ##
 # This class will use one or more of our neural network models and navigate through a scene
@@ -15,10 +16,14 @@ class SceneNavigator:
         self.controller = None
         self.atu = AI2THORUtils()
         self.action_generator = action_generator
+        self.grid_size = 0.125
 
     def process_required_habitats(self):
         self.process_habitat(10)
         self.controller.stop()
+
+    def set_action_gen(self, action_generator):
+        self.action_generator = action_generator
 
     ##
     # Process the given habitat- load it, put agent in random places and navigate from those places to some set goal.
@@ -100,20 +105,14 @@ class SceneNavigator:
             rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(rgb_img)
 
-            next_move_str = self.action_generator()
+            next_move_str = self.action_generator(pil_image)
             print(next_move_str)
 
-            match next_move_str:
-                case "RotateLeft":
-                    self.rnc.rotate_left(45)
-                case "RotateRight":
-                    self.rnc.rotate_right(45)
-                case "MoveAhead":
-                    self.rnc.move_ahead(0.25)
-                case "STOP":
-                    continue
-                case _:  # Default case
-                    return "Unknown Command"
+            if next_move_str == "STOP":
+                continue
+            else:
+                self.rnc.execute_action(next_move_str, moveMagnitude=self.grid_size, grid_size=self.grid_size,
+                                        adhere_to_grid=True)
 
 class TestActionGenerator:
     def __init__(self):
@@ -121,7 +120,8 @@ class TestActionGenerator:
                       "RotateRight", "STOP"]
         self.action_counter = 0
 
-    def __call__(self):
+    def __call__(self, pil_image):
+        print(pil_image)
         next_move_str = self.moves[self.action_counter]
         self.action_counter += 1
 

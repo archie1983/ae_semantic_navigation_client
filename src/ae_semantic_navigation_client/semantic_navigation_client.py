@@ -4,6 +4,66 @@ import time, cv2, os
 from PIL import Image
 from . import SceneNavigator
 
+class ActionGenerator:
+    def __init__(self, dreamer_socket):
+        self._cur_obs = dict(
+            pov = None,
+            is_first = False,
+            is_last = False
+        )
+        self.socket = dreamer_socket
+        self.reset()
+
+    def reset(self):
+        self._cur_obs["is_first"] = True
+        self._cur_obs["is_last"] = False
+
+    def stop_received(self):
+        self._cur_obs["is_first"] = False
+        self._cur_obs["is_last"] = True
+
+    def normal_op(self):
+        self._cur_obs["is_first"] = False
+        self._cur_obs["is_last"] = False
+
+    def __call__(self, pil_image):
+        # image received, it now needs to be sent to a Dreamer model running on Jetson,
+        # which will return an action. The action will then have to be returned from here
+        # so that it can be executed in the simulation.
+        print(pil_image)
+        img_array = np.stack([pil_image], axis=0)
+
+        self._cur_obs["pov"] = {
+            'shape': img_array.shape,
+            'dtype': str(img_array.dtype),
+            'bytes': img_array.tobytes(),
+        }
+
+        # Send request
+        self.socket.send_pyobj(self._cur_obs)
+
+        # Wait for response (this BLOCKS until Jetson replies)
+        try:
+            response = self.socket.recv_pyobj()
+        except zmq.ZMQError as e:
+            print(f"Error receiving response: {e}")
+            response = None
+
+        next_move_str = response # <- this needs to talk to Jetson over ZMQ and pass it the image
+        # along with the rest of the observation.
+        # next_move_str has to be returned from Dreamer running on Jetson and then if it is STOP, then we need to prepare
+        # a observation with is_last = True. If however this is the very first image after loading a scene, then we
+        # need to set is_first = True.
+
+        if next_move_str == "STOP":
+            self.stop_received()
+        elif next_move_str == "RESET":
+            self.reset()
+        else:
+            self.normal_op()
+
+        return next_move_str
+
 class SemanticNavigationClient:
 	LLM_PORT = 5555
 	DR_NAV_PORT = 5556
@@ -25,6 +85,11 @@ class SemanticNavigationClient:
 		self.rc_socket = self.context.socket(zmq.REQ)  # REQuest socket
 		self.rc_socket.connect(f"tcp://{jetson_ip}:{self.RC_NAV_PORT}")
 		print(f"Connected to Jetson RoomCentre navigation container at {jetson_ip}:{self.RC_NAV_PORT}")
+
+		# Local AI2-Thor simulation and action generators that talk to Dreamer models on Jetson:
+		self.rc_action_gen = ActionGenerator(self.rc_socket)
+		self.dr_action_gen = ActionGenerator(self.dr_socket)
+		self.scene_navigator = SceneNavigator(self.rc_action_gen)
 
 	def store_ref_path(self, path_imgs, path_id="?"):
 		"""
@@ -156,17 +221,6 @@ class SemanticNavigationClient:
 			print(f"Error receiving response: {e}")
 			return None
 
-# Example usage
-def gen_n_imgs(img_num):
-	"""Replace with your actual AI2-THOR frame capture"""
-	# Simulate a 64x64 RGB image
-	return np.random.randint(0, 255, (img_num, 64, 64, 3), dtype=np.uint8)
-
-def gen_1_img():
-	"""Replace with your actual AI2-THOR frame capture"""
-	# Simulate a 64x64 RGB image
-	return np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)
-
 def extract_number(filename):
 	# Extract the number from the filename (assuming it's the step count)
 	# This regex looks for digits at the beginning, end, or between non-digits
@@ -186,46 +240,34 @@ if __name__ == "__main__":
 	# Create agent and connect to Jetson
 	agent = SemanticNavigationClient(jetson_ip="192.168.0.109")
 
-	# store reference path images
-	# print(agent.store_ref_path(gen_n_imgs(10), "bathroom"))
-	# print(agent.store_ref_path(gen_n_imgs(10), "kitchen"))
-	# print(agent.store_ref_path(gen_n_imgs(10), "living_room"))
-	# print(agent.qry_path_similarity(gen_n_imgs(3)))
+	# # Object detection in an image
+	# pil_image = Image.open("/home/hp20024/robotics/latent_planning/dreamerv3/scene_pics/8.png")
+	# img_array = np.stack([pil_image], axis = 0)
+	# obj_det_res = agent.detect_objects_in_image(img_array)
+	# det_objs = set(obj_det_res['item_names'])
+	# print("AE: det objs: ", det_objs)
+	#
+	# # Room type inference from a set of objects and/or an image
+	# print("AE: room type: ", agent.classify_room_by_this_object_set_and_pic(obj_set=det_objs, img_bytes = img_array))
+	#
+	# # Embedding of a path
+	# ref_path1 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/1")
+	# ref_path2 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/2")
+	# ref_path3 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/3")
+	# ref_path4 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/4")
+	# ref_path7 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/7")
+	#
+	# ref_cmp_path = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/tmp_cmp")
+	#
+	# agent.store_ref_path(ref_path1, "ref_path1")
+	# agent.store_ref_path(ref_path2, "ref_path2")
+	# agent.store_ref_path(ref_path3, "ref_path3")
+	# agent.store_ref_path(ref_path4, "ref_path4")
+	# agent.store_ref_path(ref_path7, "ref_path7")
+	#
+	# # Comparison of a path against stored embedded ones
+	# path_cmp_res = agent.qry_path_similarity(ref_cmp_path)
+	# print("AE: path_cmp res: ", path_cmp_res)
 
-	#ref_path1 = load_path(
-	#	"/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/1")
-	#print(ref_path1)
-	#img_array = np.stack(ref_path1, axis=0)
-	#print(img_array.dtype)
-	#exit()
+	agent.scene_navigator.process_habitat(10)
 
-	# Object detection in an image
-	pil_image = Image.open("/home/hp20024/robotics/latent_planning/dreamerv3/scene_pics/8.png")
-	img_array = np.stack([pil_image], axis = 0)
-	obj_det_res = agent.detect_objects_in_image(img_array)
-	det_objs = set(obj_det_res['item_names'])
-	print("AE: det objs: ", det_objs)
-
-	# Room type inference from a set of objects and/or an image
-	print("AE: room type: ", agent.classify_room_by_this_object_set_and_pic(obj_set=det_objs, img_bytes = img_array))
-
-	# Embedding of a path
-	ref_path1 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/1")
-	ref_path2 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/2")
-	ref_path3 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/3")
-	ref_path4 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/4")
-	ref_path7 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/7")
-
-	ref_cmp_path = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/tmp_cmp")
-
-	agent.store_ref_path(ref_path1, "ref_path1")
-	agent.store_ref_path(ref_path2, "ref_path2")
-	agent.store_ref_path(ref_path3, "ref_path3")
-	agent.store_ref_path(ref_path4, "ref_path4")
-	agent.store_ref_path(ref_path7, "ref_path7")
-
-	# Comparison of a path against stored embedded ones
-	path_cmp_res = agent.qry_path_similarity(ref_cmp_path)
-	print("AE: path_cmp res: ", path_cmp_res)
-
-	#/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/tmp_cmp
