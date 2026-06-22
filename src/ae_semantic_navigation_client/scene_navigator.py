@@ -17,6 +17,10 @@ class SceneNavigator:
         self.atu = AI2THORUtils()
         self.action_generator = action_generator
         self.grid_size = 0.125
+        seed = 1983
+        self.rnd = random.Random(seed)
+        self.h_angles = [0, 45, 90, 135, 180, 225, 270, 315]
+        self.placements = []
 
     def process_required_habitats(self):
         self.process_habitat(10)
@@ -28,7 +32,7 @@ class SceneNavigator:
     ##
     # Process the given habitat- load it, put agent in random places and navigate from those places to some set goal.
     ##
-    def process_habitat(self, habitat_id):
+    def open_habitat(self, habitat_id):
         # load required habitat
         habitat = self.atu.load_proctor_habitat(habitat_id)
 
@@ -43,21 +47,12 @@ class SceneNavigator:
             self.rnc.reset_state()
             #self.rnc.set_controller(self.controller)
 
-        self.process_random_placements_in_habitat()
-
-    ##
-    # Here we will select a number of random placements and then attempt to navigate from each of them
-    # to some goal.
-    ##
-    def process_random_placements_in_habitat(self):
+    def generate_placements(self):
         ## All we need is a set of random positions and we get them like this:
         # params for the random teleportation part
-        seed = 1983
         num_stops = 20
-        num_rotates = 4
         sep = 1.0
         v_angles = [30]
-        h_angles = [0, 45, 90, 135, 180, 225, 270, 315]
 
         """
         num_stops: Number of places the agent will be placed
@@ -66,31 +61,52 @@ class SceneNavigator:
 
         kwargs: See thortils.vision.projection.open3d_pcd_from_rgbd;
         """
-        rnd = random.Random(seed)
-
         initial_agent_pose = tt.thor_agent_pose(self.controller)
         initial_horizon = tt.thor_camera_horizon(self.controller.last_event)
 
         reachable_positions = tt.thor_reachable_positions(self.controller)
         placements = sep_spatial_sample(reachable_positions, sep, num_stops,
-                                        rnd=rnd)
+                                        rnd=self.rnd)
+        self.placements = placements
+        return placements
 
-        #print(placements)
-
-        explorations_processed = 0
-        for p in placements:
+    def load_next_placement(self):
+        print("placemnts left: ", len(self.placements))
+        if len(self.placements) > 1:
+            p = self.placements.pop()
             # append a rotation to the place.
-            yaw = rnd.sample(h_angles, 1)[0]
+            yaw = self.rnd.sample(self.h_angles, 1)[0]
             place_with_rtn = p + (yaw,)
             print("Placement: ", place_with_rtn)
             ## Teleport, then start new exploration. Achieve goal. Then repeat.
             self.rnc.teleport_to(place_with_rtn)
+        else:
+            raise ValueError("No placements left")
 
-            # We've just been put in a random place in a habitat. We want to move now to where we want to go,
-            # e.g., middle of the room, a door, etc.
-            self.navigate_to_goal()
+    ##
+    # Process the given habitat- load it, put agent in random places and navigate from those places to some set goal.
+    ##
+    def process_habitat(self, habitat_id):
+        # load required habitat
+        self.open_habitat(habitat_id)
+        self.process_random_placements_in_habitat()
 
-            explorations_processed += 1
+    ##
+    # Here we will select a number of random placements and then attempt to navigate from each of them
+    # to some goal.
+    ##
+    def process_random_placements_in_habitat(self):
+        placements = self.generate_placements()
+        print(placements)
+        explorations_processed = 0
+
+        while len(self.placements) > 0:
+            try:
+                self.load_next_placement()
+                self.navigate_to_goal()
+                explorations_processed += 1
+            except ValueError:
+                return
 
     ##
     # Use a neural network to navigate to the required goal.
