@@ -111,6 +111,27 @@ class SemanticNavigationClient:
         #		self.dr_action_gen = ActionGenerator(self.dr_socket)
         self.scene_navigator = SceneNavigator(self.rc_action_gen)
 
+        # load a certain habitat
+        self.scene_navigator.open_habitat(10)
+        self.scene_navigator.generate_placements()
+        self.scene_navigator.load_next_placement()
+
+    def go_to_room_centre(self):
+        """
+        Use remote DreamerV3 model on Jetson to put the agent at the centre of the current room
+        :return:
+        """
+        self.scene_navigator.set_action_gen(self.rc_action_gen)
+        self.scene_navigator.navigate_to_goal()
+
+    def go_to_next_room(self):
+        """
+        Use remote DreamerV3 model on Jetson to go through the nearest door and into the next room
+        :return:
+        """
+        self.scene_navigator.set_action_gen(self.dr_action_gen)
+        self.scene_navigator.navigate_to_goal()
+
     def store_ref_path(self, path_imgs, path_id="?"):
         """
         Send an a collection of images, representing a reference path, to server.
