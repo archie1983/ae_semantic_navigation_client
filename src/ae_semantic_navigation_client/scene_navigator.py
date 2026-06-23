@@ -119,17 +119,7 @@ class SceneNavigator:
             event = self.controller.last_event
             img = event.cv2img
 
-            # Resize to 64 x 64
-            img = cv2.resize(
-                img,
-                (64, 64),
-                interpolation=cv2.INTER_LANCZOS4  # High quality
-            )
-
-            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb_img)
-
-            next_move_str = self.action_generator(pil_image)
+            next_move_str = self.action_generator(img)
             #print(next_move_str)
             print('.', sep='', end='')
 

@@ -11,11 +11,14 @@ class ActionGenerator:
             pov = None,
             is_first = False,
             is_last = False,
-            module = "snp"
+            module = "snp",
+            cmd = "genact"
         )
         self.socket = dreamer_socket
         self.reset()
         self.handshake_received = False
+        self.image_receiver = None
+        self.last_image_large = None
 
     def reset(self):
         self._cur_obs["is_first"] = True
@@ -42,15 +45,43 @@ class ActionGenerator:
             print("Handshake sent. Now action should follow from Jetson.")
             response = self.socket.recv_pyobj()
             print("AE: rsp: ", response)
+            self.reset()
         self.handshake_received = True
 
-    def __call__(self, pil_image):
+    def set_image_receiver(self, image_receiver):
+        """
+        This provides a way to gleam at the images received
+        :param image_receiver:
+        :return:
+        """
+        self.image_receiver = image_receiver
+
+    def __call__(self, ai2_thor_image):
         self.handshake()
+
+        # preparing 2 size images: 64x64 for DreamerV3 models and 600x600 or 640x640 whatever AI2-Thor launcher
+        # is configured with for YOLO models.
+        # Resize to 64 x 64
+        img_64x64 = cv2.resize(
+            ai2_thor_image,
+            (64, 64),
+            interpolation=cv2.INTER_LANCZOS4  # High quality
+        )
+
+        rgb_img_64x64 = cv2.cvtColor(img_64x64, cv2.COLOR_BGR2RGB)
+        pil_image_64x64 = Image.fromarray(rgb_img_64x64)
+
+        rgb_img_large = cv2.cvtColor(ai2_thor_image, cv2.COLOR_BGR2RGB)
+        pil_image_large = Image.fromarray(rgb_img_large)
+
+        if self.image_receiver is not None:
+            self.image_receiver(pil_image_large)
+            self.last_image_large = pil_image_large
         # image received, it now needs to be sent to a Dreamer model running on Jetson,
         # which will return an action. The action will then have to be returned from here
         # so that it can be executed in the simulation.
         #print(pil_image)
-        img_array = np.stack([pil_image], axis=0)
+        img_array = np.stack([pil_image_64x64], axis=0)
 
         self._cur_obs["pov"] = {
             'shape': img_array.shape,
@@ -92,9 +123,9 @@ class SemanticNavigationClient:
     def __init__(self, jetson_ip):
         self.context = zmq.Context()
         # # LLM container
-        # self.llm_socket = self.context.socket(zmq.REQ)  # REQuest socket
-        # self.llm_socket.connect(f"tcp://{jetson_ip}:{self.LLM_PORT}")
-        # print(f"Connected to Jetson LLM container at {jetson_ip}:{self.LLM_PORT}")
+        self.llm_socket = self.context.socket(zmq.REQ)  # REQuest socket
+        self.llm_socket.connect(f"tcp://{jetson_ip}:{self.LLM_PORT}")
+        print(f"Connected to Jetson LLM container at {jetson_ip}:{self.LLM_PORT}")
         #
         # # Door navigation container
         # self.dr_socket = self.context.socket(zmq.REQ)  # REQuest socket
@@ -112,15 +143,28 @@ class SemanticNavigationClient:
         self.scene_navigator = SceneNavigator(self.rc_action_gen)
 
         # load a certain habitat
-        self.scene_navigator.open_habitat(10)
+        self.scene_navigator.open_habitat(65)
         self.scene_navigator.generate_placements()
         self.scene_navigator.load_next_placement()
+
+        # keeping track of the current room
+        self.reset_seen_objs()
+
+    def reset_seen_objs(self):
+        self.objs_in_current_room = set()
+
+    def collect_seen_objects(self, pil_image):
+        objs_in_image_res = self.detect_objects_in_image(np.stack([pil_image], axis=0))
+        #print("AE, tnp: ", objs_in_image_res, " ALL: ", self.objs_in_current_room)
+        objs_in_image = set(objs_in_image_res['item_names'])
+        self.objs_in_current_room = self.objs_in_current_room.union(objs_in_image)
 
     def go_to_room_centre(self):
         """
         Use remote DreamerV3 model on Jetson to put the agent at the centre of the current room
         :return:
         """
+        self.rc_action_gen.set_image_receiver(self.collect_seen_objects)
         self.scene_navigator.set_action_gen(self.rc_action_gen)
         self.scene_navigator.navigate_to_goal()
 
@@ -129,6 +173,7 @@ class SemanticNavigationClient:
         Use remote DreamerV3 model on Jetson to go through the nearest door and into the next room
         :return:
         """
+        self.rc_action_gen.set_image_receiver(self.collect_seen_objects)
         self.scene_navigator.set_action_gen(self.dr_action_gen)
         self.scene_navigator.navigate_to_goal()
 
@@ -279,7 +324,7 @@ def load_path(base_dir):
 
 if __name__ == "__main__":
     # Create agent and connect to Jetson
-    agent = SemanticNavigationClient(jetson_ip="192.168.0.28")
+    agent = SemanticNavigationClient(jetson_ip="192.168.0.109")
 
     # # Object detection in an image
     # pil_image = Image.open("/home/hp20024/robotics/latent_planning/dreamerv3/scene_pics/8.png")
@@ -310,5 +355,21 @@ if __name__ == "__main__":
     # path_cmp_res = agent.qry_path_similarity(ref_cmp_path)
     # print("AE: path_cmp res: ", path_cmp_res)
 
-    agent.scene_navigator.process_habitat(10)
+    #agent.scene_navigator.process_habitat(10)
+    agent.go_to_room_centre()
+    print("While going to RC, I saw: ", agent.objs_in_current_room)
+    print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room, np.stack([agent.rc_action_gen.last_image_large], axis=0)))
 
+    agent.reset_seen_objs()
+    agent.scene_navigator.load_next_placement()
+    agent.go_to_room_centre()
+    print("While going to RC, I saw: ", agent.objs_in_current_room)
+    print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room,
+                                                         np.stack([agent.rc_action_gen.last_image_large], axis=0)))
+
+    agent.reset_seen_objs()
+    agent.scene_navigator.load_next_placement()
+    agent.go_to_room_centre()
+    print("While going to RC, I saw: ", agent.objs_in_current_room)
+    print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room,
+                                                         np.stack([agent.rc_action_gen.last_image_large], axis=0)))
