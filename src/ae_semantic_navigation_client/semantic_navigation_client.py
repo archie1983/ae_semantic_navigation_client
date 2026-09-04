@@ -120,17 +120,17 @@ class SemanticNavigationClient:
     DR_NAV_PORT = 5556
     RC_NAV_PORT = 5557
 
-    def __init__(self, jetson_ip):
+    def __init__(self, jetson_ip, habitat_id = 78):
         self.context = zmq.Context()
         # # LLM container
         self.llm_socket = self.context.socket(zmq.REQ)  # REQuest socket
         self.llm_socket.connect(f"tcp://{jetson_ip}:{self.LLM_PORT}")
         print(f"Connected to Jetson LLM container at {jetson_ip}:{self.LLM_PORT}")
         #
-        # # Door navigation container
-        # self.dr_socket = self.context.socket(zmq.REQ)  # REQuest socket
-        # self.dr_socket.connect(f"tcp://{jetson_ip}:{self.DR_NAV_PORT}")
-        # print(f"Connected to Jetson Door navigation container at {jetson_ip}:{self.DR_NAV_PORT}")
+        # Door navigation container
+        self.dr_socket = self.context.socket(zmq.REQ)  # REQuest socket
+        self.dr_socket.connect(f"tcp://{jetson_ip}:{self.DR_NAV_PORT}")
+        print(f"Connected to Jetson Door navigation container at {jetson_ip}:{self.DR_NAV_PORT}")
 
         # Room centre navigation container
         self.rc_socket = self.context.socket(zmq.REQ)  # REQuest socket
@@ -139,25 +139,107 @@ class SemanticNavigationClient:
 
         # Local AI2-Thor simulation and action generators that talk to Dreamer models on Jetson:
         self.rc_action_gen = ActionGenerator(self.rc_socket)
-        #		self.dr_action_gen = ActionGenerator(self.dr_socket)
+        self.dr_action_gen = ActionGenerator(self.dr_socket)
         self.scene_navigator = SceneNavigator(self.rc_action_gen)
 
         # load a certain habitat
-        self.scene_navigator.open_habitat(65)
+        self.scene_navigator.open_habitat(habitat_id)
         self.scene_navigator.generate_placements()
         self.scene_navigator.load_next_placement()
 
         # keeping track of the current room
         self.reset_seen_objs()
+        self.reset_open_door_incidence()
+        self.reset_last_10_pics()
+        self.reset_last_room_type_identifations()
 
     def reset_seen_objs(self):
         self.objs_in_current_room = set()
+
+    def reset_open_door_incidence(self):
+        self.open_door_incidence_last10 = []
+
+    def reset_last_10_pics(self):
+        self.fpv_images_last10 = []
+
+    def reset_last_room_type_identifations(self):
+        self.room_type_id_last10 = []
 
     def collect_seen_objects(self, pil_image):
         objs_in_image_res = self.detect_objects_in_image(np.stack([pil_image], axis=0))
         #print("AE, tnp: ", objs_in_image_res, " ALL: ", self.objs_in_current_room)
         objs_in_image = set(objs_in_image_res['item_names'])
         self.objs_in_current_room = self.objs_in_current_room.union(objs_in_image)
+
+    def process_incoming_image_dr(self, pil_image):
+        '''
+        Receive an image on every step during DR SNP work and process it.
+        :param pil_image:
+        :return:
+        '''
+        # let's try to ID the room. If enough objects, then use quick ID, if not, also include the image
+        objs_in_image_res = self.detect_objects_in_image(np.stack([pil_image], axis=0))
+        objs_in_image = set(objs_in_image_res['item_names'])
+
+        # if we have an open door, then remember that
+        #self.detect_open_door_in_image(pil_image)
+        if "OPENDOOR" in objs_in_image:
+            self.open_door_incidence_last10.append(True)
+        else:
+            self.open_door_incidence_last10.append(False)
+
+        if len(self.open_door_incidence_last10) > 10:
+            self.open_door_incidence_last10 = self.open_door_incidence_last10[1:]
+
+        # This is how we will store transfers between rooms:
+        #  1) Store 10 images in a buffer at all times.
+        #  2) At each step do a quick ID of the room if there's enough items. If not enough, use full ID with picture
+        #  3) Once a change of room type is reliably detected, analyze the last 10 images. Check if we see doors.
+        #  4) Those images with doors (or alternatively the first half images of the transition) get embedded and aggregated.
+        #  5) The aggregate is stored as a transition between room type 1 and room type 2.
+        # Now we will try to ID the room type
+        # collect last 10 images
+        self.fpv_images_last10.append(pil_image)
+        if len(self.fpv_images_last10) > 10:
+            self.fpv_images_last10 = self.fpv_images_last10[1:]
+
+        # decide how we're going to ID it
+        if len(objs_in_image) >= 3:
+            room_type = self.quick_classify_room_by_this_object_set(objs_in_image)
+        else:
+            room_type = self.classify_room_by_this_object_set_and_pic(objs_in_image, pil_image)
+
+        # keep last 10 IDs
+        self.room_type_id_last10.append(room_type)
+        if len(self.room_type_id_last10) > 10:
+            self.room_type_id_last10 = self.room_type_id_last10[1:]
+
+        # Now check if we have a new room type reliably detected
+        seen_room_types = list(set(self.room_type_id_last10))
+        rt_1st_half = self.room_type_id_last10[:5]
+        rt_2nd_half = self.room_type_id_last10[5:]
+        most_rt_ndx_1st_half = np.argmax([sum(1 if t == rt else 0 for t in rt_1st_half) for rt in seen_room_types])
+        most_rt_1st_half = seen_room_types[most_rt_ndx_1st_half]
+        most_rt_ndx_2nd_half = np.argmax([sum(1 if t == rt else 0 for t in rt_2nd_half) for rt in seen_room_types])
+        most_rt_2nd_half = seen_room_types[most_rt_ndx_2nd_half]
+        if most_rt_1st_half != most_rt_2nd_half:
+            # so we detected a room change. Let's embed images leading to here
+            # for door_present, img in zip(self.open_door_incidence_last10, self.fpv_images_last10):
+            #     if door_present:
+            imgs_to_embed = self.fpv_images_last10[:5]
+            self.store_door_transition(np.stack(imgs_to_embed), rt_1st_half, rt_2nd_half)
+
+    def detect_open_door_in_image(self, pil_image):
+        objs_in_image_res = self.detect_objects_in_image(np.stack([pil_image], axis=0))
+        #print("AE, tnp: ", objs_in_image_res, " ALL: ", self.objs_in_current_room)
+        objs_in_image = set(objs_in_image_res['item_names'])
+        if "OPENDOOR" in objs_in_image:
+            self.open_door_incidence_last10.append(True)
+        else:
+            self.open_door_incidence_last10.append(False)
+
+        if len(self.open_door_incidence_last10) > 10:
+            self.open_door_incidence_last10 = self.open_door_incidence_last10[1:]
 
     def go_to_room_centre(self):
         """
@@ -173,9 +255,50 @@ class SemanticNavigationClient:
         Use remote DreamerV3 model on Jetson to go through the nearest door and into the next room
         :return:
         """
-        self.rc_action_gen.set_image_receiver(self.collect_seen_objects)
+        self.dr_action_gen.set_image_receiver(self.process_incoming_image_dr)
         self.scene_navigator.set_action_gen(self.dr_action_gen)
         self.scene_navigator.navigate_to_goal()
+
+    def store_door_transition(self, path_imgs, room_from, room_to):
+        """
+        Send an a collection of images, representing a door entrance, to server.
+
+        Args:
+            image_np: numpy array (x, H, W, C) in BGR order (typical from OpenCV/AI2-THOR)
+
+        Returns:
+            success flag or None if error
+        """
+        # Serialize the images
+        data = {
+            'shape': path_imgs.shape,
+            'dtype': str(path_imgs.dtype),
+            'bytes': path_imgs.tobytes(),
+            'room_from': str(room_from),
+            'room_to': str(room_to),
+            'action': "store_door_transition",
+            'module': "path_comparator"
+        }
+
+        ## debug
+        path_id = str(room_from) + "_to_" + str(room_to)
+        os.makedirs(path_id, exist_ok=True)
+        cnt = 0
+        for img in path_imgs:
+            cnt += 1
+            cv2.imwrite(os.path.join(path_id, str(cnt) + ".png"), img)
+        ## /debug
+
+        # Send request
+        self.llm_socket.send_pyobj(data)
+
+        # Wait for response (this BLOCKS until Jetson replies)
+        try:
+            response = self.llm_socket.recv_pyobj()
+            return response
+        except zmq.ZMQError as e:
+            print(f"Error receiving response: {e}")
+            return None
 
     def store_ref_path(self, path_imgs, path_id="?"):
         """
@@ -307,6 +430,24 @@ class SemanticNavigationClient:
             print(f"Error receiving response: {e}")
             return None
 
+    def quick_classify_room_by_this_object_set(self, obj_set = None):
+        data = {
+            'obj_set': obj_set,
+            'action': 'quick_classify_room_by_this_object_set',
+            'module': 'llm_decisions'
+        }
+
+        # Send request
+        self.llm_socket.send_pyobj(data)
+
+        # Wait for response (this BLOCKS until Jetson replies)
+        try:
+            response = self.llm_socket.recv_pyobj()
+            return response
+        except zmq.ZMQError as e:
+            print(f"Error receiving response: {e}")
+            return None
+
 def extract_number(filename):
     # Extract the number from the filename (assuming it's the step count)
     # This regex looks for digits at the beginning, end, or between non-digits
@@ -324,7 +465,7 @@ def load_path(base_dir):
 
 if __name__ == "__main__":
     # Create agent and connect to Jetson
-    agent = SemanticNavigationClient(jetson_ip="192.168.0.109")
+    agent = SemanticNavigationClient(jetson_ip="192.168.0.109", habitat_id=65)
 
     # # Object detection in an image
     # pil_image = Image.open("/home/hp20024/robotics/latent_planning/dreamerv3/scene_pics/8.png")
@@ -355,21 +496,30 @@ if __name__ == "__main__":
     # path_cmp_res = agent.qry_path_similarity(ref_cmp_path)
     # print("AE: path_cmp res: ", path_cmp_res)
 
-    #agent.scene_navigator.process_habitat(10)
+    # #agent.scene_navigator.process_habitat(10)
+    # agent.go_to_room_centre()
+    # print("While going to RC, I saw: ", agent.objs_in_current_room)
+    # print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room, np.stack([agent.rc_action_gen.last_image_large], axis=0)))
+    #
+    # agent.reset_seen_objs()
+    # agent.scene_navigator.load_next_placement()
+    # agent.go_to_room_centre()
+    # print("While going to RC, I saw: ", agent.objs_in_current_room)
+    # print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room,
+    #                                                      np.stack([agent.rc_action_gen.last_image_large], axis=0)))
+    #
+    # agent.reset_seen_objs()
+    # agent.scene_navigator.load_next_placement()
+    # agent.go_to_room_centre()
+    # print("While going to RC, I saw: ", agent.objs_in_current_room)
+    # print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room,
+    #                                                      np.stack([agent.rc_action_gen.last_image_large], axis=0)))
+
     agent.go_to_room_centre()
     print("While going to RC, I saw: ", agent.objs_in_current_room)
-    print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room, np.stack([agent.rc_action_gen.last_image_large], axis=0)))
+    #print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room, np.stack([agent.rc_action_gen.last_image_large], axis=0)))
+    print(agent.quick_classify_room_by_this_object_set(agent.objs_in_current_room))
 
     agent.reset_seen_objs()
-    agent.scene_navigator.load_next_placement()
-    agent.go_to_room_centre()
-    print("While going to RC, I saw: ", agent.objs_in_current_room)
-    print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room,
-                                                         np.stack([agent.rc_action_gen.last_image_large], axis=0)))
-
-    agent.reset_seen_objs()
-    agent.scene_navigator.load_next_placement()
-    agent.go_to_room_centre()
-    print("While going to RC, I saw: ", agent.objs_in_current_room)
-    print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room,
-                                                         np.stack([agent.rc_action_gen.last_image_large], axis=0)))
+    agent.go_to_next_room()
+    print("Presence of OPENDOOR in last 10 images: ", agent.open_door_incidence_last10)
