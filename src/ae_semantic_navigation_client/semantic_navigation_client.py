@@ -4,6 +4,7 @@ import time, cv2, os
 from PIL import Image
 from scene_navigator import SceneNavigator
 from ai2_thor_model_training import index_to_action
+from ai2_thor_model_training.ae_utils import RoomType
 
 class ActionGenerator:
     def __init__(self, dreamer_socket):
@@ -153,6 +154,8 @@ class SemanticNavigationClient:
         self.reset_last_10_pics()
         self.reset_last_room_type_identifations()
 
+        self.common_objs = {'OPENDOOR', 'CLOSEDDOOR', 'FLOOR'}
+
     def reset_seen_objs(self):
         self.objs_in_current_room = set()
 
@@ -203,31 +206,35 @@ class SemanticNavigationClient:
         if len(self.fpv_images_last10) > 10:
             self.fpv_images_last10 = self.fpv_images_last10[1:]
 
+        objs_in_image_no_commons = objs_in_image - self.common_objs
         # decide how we're going to ID it
-        if len(objs_in_image) >= 3:
+        if len(objs_in_image_no_commons) > 0:
             room_type = self.quick_classify_room_by_this_object_set(objs_in_image)
         else:
-            room_type = self.classify_room_by_this_object_set_and_pic(objs_in_image, pil_image)
+            #room_type = self.classify_room_by_this_object_set_and_pic(objs_in_image, np.stack([pil_image], axis = 0))
+            room_type = None
 
-        # keep last 10 IDs
-        self.room_type_id_last10.append(room_type)
-        if len(self.room_type_id_last10) > 10:
-            self.room_type_id_last10 = self.room_type_id_last10[1:]
+        if room_type != None and room_type != RoomType.NOT_KNOWN and room_type != RoomType.NOT_CLASSIFIED:
+            # keep last 10 IDs that were successfully identified
+            self.room_type_id_last10.append(room_type)
+            if len(self.room_type_id_last10) > 10:
+                self.room_type_id_last10 = self.room_type_id_last10[1:]
 
-        # Now check if we have a new room type reliably detected
-        seen_room_types = list(set(self.room_type_id_last10))
-        rt_1st_half = self.room_type_id_last10[:5]
-        rt_2nd_half = self.room_type_id_last10[5:]
-        most_rt_ndx_1st_half = np.argmax([sum(1 if t == rt else 0 for t in rt_1st_half) for rt in seen_room_types])
-        most_rt_1st_half = seen_room_types[most_rt_ndx_1st_half]
-        most_rt_ndx_2nd_half = np.argmax([sum(1 if t == rt else 0 for t in rt_2nd_half) for rt in seen_room_types])
-        most_rt_2nd_half = seen_room_types[most_rt_ndx_2nd_half]
-        if most_rt_1st_half != most_rt_2nd_half:
-            # so we detected a room change. Let's embed images leading to here
-            # for door_present, img in zip(self.open_door_incidence_last10, self.fpv_images_last10):
-            #     if door_present:
-            imgs_to_embed = self.fpv_images_last10[:5]
-            self.store_door_transition(np.stack(imgs_to_embed), rt_1st_half, rt_2nd_half)
+            # Now check if we have a new room type reliably detected
+            if len(self.room_type_id_last10) > 8:
+                seen_room_types = list(set(self.room_type_id_last10))
+                rt_1st_half = self.room_type_id_last10[:5]
+                rt_2nd_half = self.room_type_id_last10[5:]
+                most_rt_ndx_1st_half = np.argmax([sum(1 if t == rt else 0 for t in rt_1st_half) for rt in seen_room_types])
+                most_rt_1st_half = seen_room_types[most_rt_ndx_1st_half]
+                most_rt_ndx_2nd_half = np.argmax([sum(1 if t == rt else 0 for t in rt_2nd_half) for rt in seen_room_types])
+                most_rt_2nd_half = seen_room_types[most_rt_ndx_2nd_half]
+                if most_rt_1st_half != most_rt_2nd_half:
+                    # so we detected a room change. Let's embed images leading to here
+                    # for door_present, img in zip(self.open_door_incidence_last10, self.fpv_images_last10):
+                    #     if door_present:
+                    imgs_to_embed = self.fpv_images_last10[:5]
+                    self.store_door_transition(np.stack(imgs_to_embed), most_rt_1st_half, most_rt_2nd_half)
 
     def detect_open_door_in_image(self, pil_image):
         objs_in_image_res = self.detect_objects_in_image(np.stack([pil_image], axis=0))
@@ -274,14 +281,14 @@ class SemanticNavigationClient:
             'shape': path_imgs.shape,
             'dtype': str(path_imgs.dtype),
             'bytes': path_imgs.tobytes(),
-            'room_from': str(room_from),
-            'room_to': str(room_to),
+            'room_from': room_from.name,
+            'room_to': room_to.name,
             'action': "store_door_transition",
             'module': "path_comparator"
         }
 
         ## debug
-        path_id = str(room_from) + "_to_" + str(room_to)
+        path_id = room_from.name + "_to_" + room_to.name
         os.makedirs(path_id, exist_ok=True)
         cnt = 0
         for img in path_imgs:
@@ -515,10 +522,10 @@ if __name__ == "__main__":
     # print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room,
     #                                                      np.stack([agent.rc_action_gen.last_image_large], axis=0)))
 
-    agent.go_to_room_centre()
-    print("While going to RC, I saw: ", agent.objs_in_current_room)
-    #print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room, np.stack([agent.rc_action_gen.last_image_large], axis=0)))
-    print(agent.quick_classify_room_by_this_object_set(agent.objs_in_current_room))
+    # agent.go_to_room_centre()
+    # print("While going to RC, I saw: ", agent.objs_in_current_room)
+    # #print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room, np.stack([agent.rc_action_gen.last_image_large], axis=0)))
+    # print(agent.quick_classify_room_by_this_object_set(agent.objs_in_current_room))
 
     agent.reset_seen_objs()
     agent.go_to_next_room()
