@@ -187,7 +187,7 @@ class SemanticNavigationClient:
         # let's try to ID the room. If enough objects, then use quick ID, if not, also include the image
         objs_in_image_res = self.detect_objects_in_image(np.stack([pil_image], axis=0))
         #objs_in_image = set(objs_in_image_res['item_names'])
-        print(objs_in_image_res)
+        #print(objs_in_image_res)
 
         item_infos = objs_in_image_res['item_infos']
         objs_in_image = set([item['name'] for item in item_infos])
@@ -220,7 +220,7 @@ class SemanticNavigationClient:
 
         room_type = room_detection['room_type']
         if room_type != None and room_type != room_type.NOT_KNOWN and room_type != room_type.NOT_CLASSIFIED:
-            print("detected RT: ", room_type, (room_type == RoomType.NOT_KNOWN), (room_type == room_type.NOT_KNOWN), objs_in_image)
+            print("detected RT: ", room_type, objs_in_image)
             # keep last 10 IDs that were successfully identified
             self.room_detections_last10.append(room_detection)
 
@@ -242,7 +242,7 @@ class SemanticNavigationClient:
                 most_common_room, count = room_counts.most_common(1)[0]
 
                 # Only transition if the dominant room has changed AND meets a threshold (e.g., 7/10 frames)
-                if most_common_room != self.current_confirmed_room and count >= 7:
+                if most_common_room != self.current_room_type and count >= 7:
                     # Trigger your embedding storage and transition mechanics here
                     self.prev_room_type = self.current_room_type
                     self.current_room_type = most_common_room
@@ -271,6 +271,8 @@ class SemanticNavigationClient:
             #         print("TRANS: ", self.room_type_id_last10, most_rt_1st_half, most_rt_2nd_half)
 
     def update_room_detections_after_instability(self, instability_info):
+        if instability_info is None or len(instability_info) <= 0: return
+
         affected_ids = [instability['track_id'] for instability in instability_info]
         updated_rds = []
 
@@ -282,8 +284,9 @@ class SemanticNavigationClient:
             for ii in rd['item_infos']:
                 # if the track_id is affected, then exclude this item
                 if ii['track_id'] not in affected_ids:
-                    updated_rd_items.append()
+                    updated_rd_items.append(ii)
                 else:
+                    #print("AE: throwing out: ", ii)
                     item_infos_updated = True
 
             # now we have updated items (either same as before or fewer)
@@ -292,6 +295,7 @@ class SemanticNavigationClient:
             # if there was a change, then let's re-classify
             if item_infos_updated:
                 new_rd = self.item_infos_to_roomtype(rd['item_infos'])
+                #print("AE: reclass:  was: ", rd, " now: ", new_rd)
                 # if classification was possible, then store it
                 if new_rd['room_type'] != None:
                     updated_rds.append(new_rd)
@@ -300,6 +304,7 @@ class SemanticNavigationClient:
                 updated_rds.append(rd)
 
         # update what we have
+        #print("AE: changed self.room_detections_last10 from: ", self.room_detections_last10, " to: ", updated_rds, " affected_ids: ", affected_ids)
         self.room_detections_last10 = updated_rds
         return updated_rds
 
