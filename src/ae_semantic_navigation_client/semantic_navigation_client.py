@@ -4,7 +4,8 @@ import time, cv2, os
 from PIL import Image
 from scene_navigator import SceneNavigator
 from ai2_thor_model_training import index_to_action
-from ai2_thor_model_training.ae_utils import RoomType
+from ae_llm_navigation_decisions import RoomType
+from collections import Counter
 
 class ActionGenerator:
     def __init__(self, dreamer_socket):
@@ -155,6 +156,8 @@ class SemanticNavigationClient:
         self.reset_last_room_type_identifations()
 
         self.common_objs = {'OPENDOOR', 'CLOSEDDOOR', 'FLOOR'}
+        self.current_room_type = RoomType.NOT_KNOWN
+        self.prev_room_type = RoomType.NOT_KNOWN
 
     def reset_seen_objs(self):
         self.objs_in_current_room = set()
@@ -167,6 +170,7 @@ class SemanticNavigationClient:
 
     def reset_last_room_type_identifations(self):
         self.room_type_id_last10 = []
+        self.room_detections_last10 = []
 
     def collect_seen_objects(self, pil_image):
         objs_in_image_res = self.detect_objects_in_image(np.stack([pil_image], axis=0))
@@ -182,7 +186,15 @@ class SemanticNavigationClient:
         '''
         # let's try to ID the room. If enough objects, then use quick ID, if not, also include the image
         objs_in_image_res = self.detect_objects_in_image(np.stack([pil_image], axis=0))
-        objs_in_image = set(objs_in_image_res['item_names'])
+        #objs_in_image = set(objs_in_image_res['item_names'])
+        print(objs_in_image_res)
+
+        item_infos = objs_in_image_res['item_infos']
+        objs_in_image = set([item['name'] for item in item_infos])
+        instability_info = objs_in_image_res['instability_info']
+
+        # find out what room it is based on the items
+        room_detection = self.item_infos_to_roomtype(item_infos)
 
         # if we have an open door, then remember that
         #self.detect_open_door_in_image(pil_image)
@@ -206,6 +218,96 @@ class SemanticNavigationClient:
         if len(self.fpv_images_last10) > 10:
             self.fpv_images_last10 = self.fpv_images_last10[1:]
 
+        room_type = room_detection['room_type']
+        if room_type != None and room_type != room_type.NOT_KNOWN and room_type != room_type.NOT_CLASSIFIED:
+            print("detected RT: ", room_type, (room_type == RoomType.NOT_KNOWN), (room_type == room_type.NOT_KNOWN), objs_in_image)
+            # keep last 10 IDs that were successfully identified
+            self.room_detections_last10.append(room_detection)
+
+            # update using instability info if needed
+            self.update_room_detections_after_instability(instability_info)
+
+            ## TODO: Here we have to rethink the decision. I think we need some clustering and the biggest cluster wins.
+            if len(self.room_detections_last10) > 10:
+                #self.room_type_id_last10 = self.room_type_id_last10[1:]
+                #self.room_detections_last10 = self.room_detections_last10[1:]
+                self.room_detections_last10.pop(0)
+
+            self.room_type_id_last10 = [rd['room_type'] for rd in self.room_detections_last10]
+
+            # Here we evaluate room type clusters
+            if len(self.room_type_id_last10) >= 10:
+                # Use standard library Counter to find the dominant room type in the buffer
+                room_counts = Counter(self.room_type_id_last10)
+                most_common_room, count = room_counts.most_common(1)[0]
+
+                # Only transition if the dominant room has changed AND meets a threshold (e.g., 7/10 frames)
+                if most_common_room != self.current_confirmed_room and count >= 7:
+                    # Trigger your embedding storage and transition mechanics here
+                    self.prev_room_type = self.current_room_type
+                    self.current_room_type = most_common_room
+
+                    imgs_to_embed = self.fpv_images_last10[:5]  # Or save the mid-point transition images
+                    self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type)
+                    print("TRANS: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
+            #
+
+            # # Now check if we have a new room type reliably detected
+            # if len(self.room_type_id_last10) > 8:
+            #     seen_room_types = list(set(self.room_type_id_last10))
+            #     rt_1st_half = self.room_type_id_last10[:5]
+            #     rt_2nd_half = self.room_type_id_last10[5:]
+            #
+            #     most_rt_ndx_1st_half = np.argmax([sum(1 if t == rt else 0 for t in rt_1st_half) for rt in seen_room_types])
+            #     most_rt_1st_half = seen_room_types[most_rt_ndx_1st_half]
+            #     most_rt_ndx_2nd_half = np.argmax([sum(1 if t == rt else 0 for t in rt_2nd_half) for rt in seen_room_types])
+            #     most_rt_2nd_half = seen_room_types[most_rt_ndx_2nd_half]
+            #     if most_rt_1st_half != most_rt_2nd_half:
+            #         # so we detected a room change. Let's embed images leading to here
+            #         # for door_present, img in zip(self.open_door_incidence_last10, self.fpv_images_last10):
+            #         #     if door_present:
+            #         imgs_to_embed = self.fpv_images_last10[:5]
+            #         self.store_door_transition(np.stack(imgs_to_embed), most_rt_1st_half, most_rt_2nd_half)
+            #         print("TRANS: ", self.room_type_id_last10, most_rt_1st_half, most_rt_2nd_half)
+
+    def update_room_detections_after_instability(self, instability_info):
+        affected_ids = [instability['track_id'] for instability in instability_info]
+        updated_rds = []
+
+        # go through our collected room detections and check if we need to re-detect
+        for rd in self.room_detections_last10:
+            updated_rd_items = []
+            item_infos_updated = False
+            # look at each item
+            for ii in rd['item_infos']:
+                # if the track_id is affected, then exclude this item
+                if ii['track_id'] not in affected_ids:
+                    updated_rd_items.append()
+                else:
+                    item_infos_updated = True
+
+            # now we have updated items (either same as before or fewer)
+            rd['item_infos'] = updated_rd_items
+
+            # if there was a change, then let's re-classify
+            if item_infos_updated:
+                new_rd = self.item_infos_to_roomtype(rd['item_infos'])
+                # if classification was possible, then store it
+                if new_rd['room_type'] != None:
+                    updated_rds.append(new_rd)
+            else:
+                # if no change, then keep original
+                updated_rds.append(rd)
+
+        # update what we have
+        self.room_detections_last10 = updated_rds
+        return updated_rds
+
+    ##
+    # Turn a collection of items and their attributes into a room type
+    ##
+    def item_infos_to_roomtype(self, item_infos):
+        objs_in_image = set([item['name'] for item in item_infos])
         objs_in_image_no_commons = objs_in_image - self.common_objs
         # decide how we're going to ID it
         if len(objs_in_image_no_commons) > 0:
@@ -214,27 +316,7 @@ class SemanticNavigationClient:
             #room_type = self.classify_room_by_this_object_set_and_pic(objs_in_image, np.stack([pil_image], axis = 0))
             room_type = None
 
-        if room_type != None and room_type != RoomType.NOT_KNOWN and room_type != RoomType.NOT_CLASSIFIED:
-            # keep last 10 IDs that were successfully identified
-            self.room_type_id_last10.append(room_type)
-            if len(self.room_type_id_last10) > 10:
-                self.room_type_id_last10 = self.room_type_id_last10[1:]
-
-            # Now check if we have a new room type reliably detected
-            if len(self.room_type_id_last10) > 8:
-                seen_room_types = list(set(self.room_type_id_last10))
-                rt_1st_half = self.room_type_id_last10[:5]
-                rt_2nd_half = self.room_type_id_last10[5:]
-                most_rt_ndx_1st_half = np.argmax([sum(1 if t == rt else 0 for t in rt_1st_half) for rt in seen_room_types])
-                most_rt_1st_half = seen_room_types[most_rt_ndx_1st_half]
-                most_rt_ndx_2nd_half = np.argmax([sum(1 if t == rt else 0 for t in rt_2nd_half) for rt in seen_room_types])
-                most_rt_2nd_half = seen_room_types[most_rt_ndx_2nd_half]
-                if most_rt_1st_half != most_rt_2nd_half:
-                    # so we detected a room change. Let's embed images leading to here
-                    # for door_present, img in zip(self.open_door_incidence_last10, self.fpv_images_last10):
-                    #     if door_present:
-                    imgs_to_embed = self.fpv_images_last10[:5]
-                    self.store_door_transition(np.stack(imgs_to_embed), most_rt_1st_half, most_rt_2nd_half)
+        return {'room_type': room_type, 'item_infos': item_infos}
 
     def detect_open_door_in_image(self, pil_image):
         objs_in_image_res = self.detect_objects_in_image(np.stack([pil_image], axis=0))
