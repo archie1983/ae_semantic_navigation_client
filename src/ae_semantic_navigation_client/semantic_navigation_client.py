@@ -243,7 +243,8 @@ class SemanticNavigationClient:
         # store FPVs
         self.fpv_images_last_x.append(pil_image)
         if len(self.fpv_images_last_x) > self.IMGS_TO_KEEP:
-            self.fpv_images_last_x = self.fpv_images_last_x[1:]
+            #self.fpv_images_last_x = self.fpv_images_last_x[1:]
+            self.fpv_images_last_x.pop(0)
 
         # if we have an open door, then remember that
         #self.detect_open_door_in_image(pil_image)
@@ -253,7 +254,8 @@ class SemanticNavigationClient:
             self.open_door_incidence_last10.append(False)
 
         if len(self.open_door_incidence_last10) > 10:
-            self.open_door_incidence_last10 = self.open_door_incidence_last10[1:]
+            #self.open_door_incidence_last10 = self.open_door_incidence_last10[1:]
+            self.open_door_incidence_last10.pop(0)
 
         # If room transition spotted, then we want to manage objects seen in the previous room
         if room_transition_spotted:
