@@ -121,6 +121,7 @@ class SemanticNavigationClient:
     LLM_PORT = 5555
     DR_NAV_PORT = 5556
     RC_NAV_PORT = 5557
+    PER_NAV_PORT = 5558
 
     def __init__(self, jetson_ip, habitat_id = 78):
         self.context = zmq.Context()
@@ -139,9 +140,15 @@ class SemanticNavigationClient:
         self.rc_socket.connect(f"tcp://{jetson_ip}:{self.RC_NAV_PORT}")
         print(f"Connected to Jetson RoomCentre navigation container at {jetson_ip}:{self.RC_NAV_PORT}")
 
+        # Perimeter navigation container
+        self.per_socket = self.context.socket(zmq.REQ)  # REQuest socket
+        self.per_socket.connect(f"tcp://{jetson_ip}:{self.PER_NAV_PORT}")
+        print(f"Connected to Jetson RoomCentre navigation container at {jetson_ip}:{self.PER_NAV_PORT}")
+
         # Local AI2-Thor simulation and action generators that talk to Dreamer models on Jetson:
         self.rc_action_gen = ActionGenerator(self.rc_socket)
         self.dr_action_gen = ActionGenerator(self.dr_socket)
+        self.per_action_gen = ActionGenerator(self.per_socket)
         self.scene_navigator = SceneNavigator(self.rc_action_gen)
 
         # load a certain habitat
@@ -199,7 +206,7 @@ class SemanticNavigationClient:
         # collect last 10 images
         room_type = room_detection['room_type']
         if room_type != None and room_type != room_type.NOT_KNOWN and room_type != room_type.NOT_CLASSIFIED:
-            print("detected RT: ", room_type, objs_in_image)
+            #print("detected RT: ", room_type, objs_in_image)
             # keep last 10 IDs that were successfully identified
             self.room_detections_last10.append(room_detection)
 
@@ -213,6 +220,8 @@ class SemanticNavigationClient:
 
             self.room_type_id_last10 = [rd['room_type'] for rd in self.room_detections_last10]
 
+            #print("AE: RT: ", self.room_type_id_last10)
+
             # Here we evaluate room type clusters
             if len(self.room_type_id_last10) >= 10:
                 # Use standard library Counter to find the dominant room type in the buffer
@@ -220,47 +229,18 @@ class SemanticNavigationClient:
                 most_common_room, count = room_counts.most_common(1)[0]
 
                 # Only transition if the dominant room has changed AND meets a threshold (e.g., 7/10 frames)
-                if most_common_room != self.current_room_type and count >= 7:
+                if most_common_room != self.current_room_type and count >= 6:
                     # Trigger your embedding storage and transition mechanics here
                     self.prev_room_type = self.current_room_type
                     self.current_room_type = most_common_room
                     room_transition_spotted = True
+                # else:
+                #     print("AE: most_common_room: ", most_common_room, " count: ", count)
 
         # store FPVs
         self.fpv_images_last10.append(pil_image)
         if len(self.fpv_images_last10) > 10:
             self.fpv_images_last10 = self.fpv_images_last10[1:]
-
-        # If room transition spotted, then we want to manage objects seen in the previous room
-        if room_transition_spotted:
-            # If previous room is defined, then reset objects seen in that room because we will store new objects
-            # If it is not defined, then assume that we're discovering the room type for the first time and the
-            # collected objects need not be erased, but collected for the new room type, which will happen outside this
-            # if block.
-            if (self.prev_room_type != None
-                    and self.prev_room_type != RoomType.NOT_KNOWN
-                    and self.prev_room_type != RoomType.NOT_CLASSIFIED):
-                self.reset_seen_objs()
-
-        # collect seen objects for this room type (or room)
-        self.objs_in_current_room = self.objs_in_current_room.union(objs_in_image)
-
-        # if we have a defined current room, then store that room's objects in the dict
-        if (self.current_room_type != None
-                and self.current_room_type != RoomType.NOT_KNOWN
-                and self.current_room_type != RoomType.NOT_CLASSIFIED):
-            self.objects_by_room[self.current_room_type] = self.objs_in_current_room
-
-        return item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted
-
-    def process_incoming_image_dr(self, pil_image):
-        '''
-        Receive an image on every step during DR SNP work and process it.
-        :param pil_image:
-        :return:
-        '''
-        # let's try to ID the room.
-        item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted = self.process_incoming_image(pil_image)
 
         # if we have an open door, then remember that
         #self.detect_open_door_in_image(pil_image)
@@ -272,10 +252,60 @@ class SemanticNavigationClient:
         if len(self.open_door_incidence_last10) > 10:
             self.open_door_incidence_last10 = self.open_door_incidence_last10[1:]
 
+        # If room transition spotted, then we want to manage objects seen in the previous room
         if room_transition_spotted:
-            # TODO: Now analyse visibility of open doors and decide if we store a door transition
-            imgs_to_embed = self.fpv_images_last10[:5]  # Or save the mid-point transition images
-            self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type)
+            # If previous room is defined, then reset objects seen in that room because we will store new objects
+            # If it is not defined, then assume that we're discovering the room type for the first time and the
+            # collected objects need not be erased, but collected for the new room type, which will happen outside this
+            # if block.
+            if (not(self.is_room_nonsense(self.prev_room_type) or self.is_room_nonsense(self.current_room_type))):
+                self.reset_seen_objs()
+
+            # this might be a case of walking through an open plan living room into a kitchen (in which case we won't
+            # have a door, or this might be a transition through a door. If it's through a door, then we want to save it
+            #
+            # For now let's detect all transitions regardless of doors.
+            #if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last10) > 5:
+                imgs_to_embed = self.fpv_images_last10[:5]  # Or save the mid-point transition images
+                self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type)
+
+        # collect seen objects for this room type (or room)
+        self.objs_in_current_room = self.objs_in_current_room.union(objs_in_image)
+
+        # if we have a defined current room, then store that room's objects in the dict
+        if (not self.is_room_nonsense(self.current_room_type)):
+            self.objects_by_room[self.current_room_type] = self.objs_in_current_room
+
+        return item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted
+
+    def is_room_nonsense(self, current_room_type):
+        if (self.prev_room_type == None
+            or self.prev_room_type == RoomType.NOT_KNOWN
+            or self.prev_room_type == RoomType.NOT_CLASSIFIED):
+            return True
+        else:
+            return False
+
+    def process_incoming_image_dr(self, pil_image):
+        '''
+        Receive an image on every step during DR SNP work and process it.
+        :param pil_image:
+        :return:
+        '''
+        # let's try to ID the room.
+        item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted = self.process_incoming_image(pil_image)
+
+        # TODO: If opendoor incidence getting high, then start querying the door imagery:
+        if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last10) > 5:
+            imgs_to_embed = self.fpv_images_last10[5:]  # get 5 last images
+            qry_result = self.qry_door_transition(np.stack(imgs_to_embed))
+            #print("AE: IMG QUERY: ", qry_result)
+
+            if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] > 0.75:
+                best_match = qry_result['qry_results'][0]
+                print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}")
+
+        if room_transition_spotted:
             print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
 
     def process_incoming_image_rc(self, pil_image):
@@ -291,6 +321,20 @@ class SemanticNavigationClient:
             print("TRANS RC: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
 
         # Not sure what else we might want to do in the room centre finder - at least for now while I'm focussing on environment exploration.
+
+    def process_incoming_image_per(self, pil_image):
+        '''
+        Receive an image on every step during PER SNP work and process it.
+        :param pil_image:
+        :return:
+        '''
+        # let's try to ID the room.
+        item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted = self.process_incoming_image(pil_image)
+
+        if room_transition_spotted:
+            print("TRANS PER: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
+
+        # Not sure what else we might want to do in the perimeter finder - at least for now while I'm focussing on environment exploration.
 
     def update_room_detections_after_instability(self, instability_info):
         if instability_info is None or len(instability_info) <= 0: return
@@ -363,6 +407,15 @@ class SemanticNavigationClient:
         self.scene_navigator.set_action_gen(self.dr_action_gen)
         self.scene_navigator.navigate_to_goal()
 
+    def go_to_perimeter_of_room(self):
+        """
+        Use remote DreamerV3 model on Jetson to go through the nearest door and into the next room
+        :return:
+        """
+        self.per_action_gen.set_image_receiver(self.process_incoming_image_per)
+        self.scene_navigator.set_action_gen(self.per_action_gen)
+        self.scene_navigator.navigate_to_goal()
+
     def store_door_transition(self, path_imgs, room_from, room_to):
         """
         Send an a collection of images, representing a door entrance, to server.
@@ -388,10 +441,41 @@ class SemanticNavigationClient:
         path_id = room_from.name + "_to_" + room_to.name
         os.makedirs(path_id, exist_ok=True)
         cnt = 0
+        print("STORING ", len(path_imgs), " images.")
         for img in path_imgs:
             cnt += 1
             cv2.imwrite(os.path.join(path_id, str(cnt) + ".png"), img)
         ## /debug
+
+        # Send request
+        self.llm_socket.send_pyobj(data)
+
+        # Wait for response (this BLOCKS until Jetson replies)
+        try:
+            response = self.llm_socket.recv_pyobj()
+            return response
+        except zmq.ZMQError as e:
+            print(f"Error receiving response: {e}")
+            return None
+
+    def qry_door_transition(self, path_imgs):
+        """
+        Send a collection of images, representing a door entrance, to server and get back results of similar doors if any.
+
+        Args:
+            image_np: numpy array (x, H, W, C) in BGR order (typical from OpenCV/AI2-THOR)
+
+        Returns:
+            success flag or None if error
+        """
+        # Serialize the images
+        data = {
+            'shape': path_imgs.shape,
+            'dtype': str(path_imgs.dtype),
+            'bytes': path_imgs.tobytes(),
+            'action': "qry_door_transition",
+            'module': "path_comparator"
+        }
 
         # Send request
         self.llm_socket.send_pyobj(data)
@@ -625,5 +709,10 @@ if __name__ == "__main__":
     # print(agent.quick_classify_room_by_this_object_set(agent.objs_in_current_room))
 
     agent.reset_seen_objs()
-    agent.go_to_next_room()
+    rooms_to_traverse = 7
+    for i in range(rooms_to_traverse):
+        agent.go_to_room_centre()
+        agent.go_to_next_room()
     print("Presence of OPENDOOR in last 10 images: ", agent.open_door_incidence_last10)
+
+    # TODO: Next step: implement not going through a visited door again during exploration.
