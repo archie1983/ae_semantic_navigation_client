@@ -122,6 +122,9 @@ class SemanticNavigationClient:
     DR_NAV_PORT = 5556
     RC_NAV_PORT = 5557
     PER_NAV_PORT = 5558
+    # Images for VPR (Visual Place Recognition)
+    IMGS_TO_KEEP = 20
+    IMGS_TO_EMBED = 10
 
     def __init__(self, jetson_ip, habitat_id = 78):
         self.context = zmq.Context()
@@ -159,7 +162,7 @@ class SemanticNavigationClient:
         # keeping track of the current room
         self.reset_seen_objs()
         self.reset_open_door_incidence()
-        self.reset_last_10_pics()
+        self.reset_last_pics()
         self.reset_last_room_type_identifations()
 
         self.common_objs = {'OPENDOOR', 'CLOSEDDOOR', 'FLOOR'}
@@ -173,8 +176,8 @@ class SemanticNavigationClient:
     def reset_open_door_incidence(self):
         self.open_door_incidence_last10 = []
 
-    def reset_last_10_pics(self):
-        self.fpv_images_last10 = []
+    def reset_last_pics(self):
+        self.fpv_images_last_x = []
 
     def reset_last_room_type_identifations(self):
         self.room_type_id_last10 = []
@@ -238,9 +241,9 @@ class SemanticNavigationClient:
                 #     print("AE: most_common_room: ", most_common_room, " count: ", count)
 
         # store FPVs
-        self.fpv_images_last10.append(pil_image)
-        if len(self.fpv_images_last10) > 10:
-            self.fpv_images_last10 = self.fpv_images_last10[1:]
+        self.fpv_images_last_x.append(pil_image)
+        if len(self.fpv_images_last_x) > self.IMGS_TO_KEEP:
+            self.fpv_images_last_x = self.fpv_images_last_x[1:]
 
         # if we have an open door, then remember that
         #self.detect_open_door_in_image(pil_image)
@@ -265,8 +268,8 @@ class SemanticNavigationClient:
             # have a door, or this might be a transition through a door. If it's through a door, then we want to save it
             #
             # For now let's detect all transitions regardless of doors.
-            #if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last10) > 5:
-                imgs_to_embed = self.fpv_images_last10[:5]  # Or save the mid-point transition images
+            #if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:
+                imgs_to_embed = self.fpv_images_last_x[:self.IMGS_TO_EMBED]  # Or save the mid-point transition images
                 self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type)
 
         # collect seen objects for this room type (or room)
@@ -296,14 +299,17 @@ class SemanticNavigationClient:
         item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted = self.process_incoming_image(pil_image)
 
         # TODO: If opendoor incidence getting high, then start querying the door imagery:
-        if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last10) > 5:
-            imgs_to_embed = self.fpv_images_last10[5:]  # get 5 last images
+        # TODO: Raise the threshold from 75% to at least 85%
+        # TODO: Store images from earlier in the sequence so that we detect coming transition earlier and also to make it more distinct
+        # TODO: Consider querying on a smaller set of images to avoid extra data in them
+        if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > self.IMGS_TO_EMBED:
+            imgs_to_embed = self.fpv_images_last_x[self.IMGS_TO_EMBED:]  # get 5 last images
             qry_result = self.qry_door_transition(np.stack(imgs_to_embed))
             #print("AE: IMG QUERY: ", qry_result)
 
             if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] > 0.75:
                 best_match = qry_result['qry_results'][0]
-                print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}")
+                print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, conf = {qry_result['qry_results'][0]['similarity']}")
 
         if room_transition_spotted:
             print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
