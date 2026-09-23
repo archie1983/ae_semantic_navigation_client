@@ -179,6 +179,9 @@ class SemanticNavigationClient:
         self.objects_by_room = dict()
 
         self.current_active_SNP = SNPType.NONE
+        # A queue to hold pending remedy functions
+        self.remedy_commands = deque()
+        self.main_commands = deque()
 
     def reset_seen_objs(self):
         self.objs_in_current_room = set()
@@ -331,12 +334,15 @@ class SemanticNavigationClient:
             print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
 
     def callback_from_interrupted_snp(self):
-        print("AE: SNP INTERRUPTED AND SCENE NAVIGATOR CALLED BACK. SNP interrupted: ", self.current_active_SNP)
+        print("AE: SNP INTERRUPTED AND SCENE NAVIGATOR CALLED BACK. Current active: ", self.current_active_SNP)
         # if we interrupted a door walker, then we probably want to go back to the room centre, but we can't launch
         # that SNP directly from here because this interrupt function needs to exit so that self.scene_navigator.navigate_to_goal()
         # can complete and set self.current_active_SNP to NONE and only then we should launch the new SNP.
         if self.current_active_SNP == SNPType.DOOR_FINDER:
-            pass
+            # Instead of calling it, push the function reference to our queue
+            print("AE: Enqueuing remedy actions...")
+            self.remedy_commands.append(self.go_to_room_centre)
+            self.remedy_commands.append(self.go_to_next_room)
 
     def process_incoming_image_rc(self, pil_image):
         '''
@@ -672,6 +678,37 @@ class SemanticNavigationClient:
             print(f"Error receiving response: {e}")
             return None
 
+    def run_agent_tick(self):
+        """Call this from a separate thread."""
+        # 1. If there's an active queued command (like a remedy), run it first
+        if self.remedy_commands:
+            next_command = self.remedy_commands.popleft()
+        # 2. Otherwise, continue standard routine behaviors
+        elif self.main_commands:
+            next_command = self.main_commands.popleft()
+        else:
+            next_command = None
+
+        if next_command is not None:
+            next_command()  # Executes natively on spawned thread
+            return True
+        else:
+            return False
+
+        # sleep
+
+    def add_main_command(self, command):
+        self.main_commands.append(command)
+
+    def do_work(self):
+        cmd_cnt = 0
+        # do run_agent_tick until no more commands left to do
+        while (self.run_agent_tick()):
+            cmd_cnt += 1
+            print("AE: end of command ", cmd_cnt)
+
+        print("AE: All work complete")
+
 def extract_number(filename):
     # Extract the number from the filename (assuming it's the step count)
     # This regex looks for digits at the beginning, end, or between non-digits
@@ -747,8 +784,9 @@ if __name__ == "__main__":
     agent.reset_seen_objs()
     rooms_to_traverse = 7
     for i in range(rooms_to_traverse):
-        agent.go_to_room_centre()
-        agent.go_to_next_room()
-    print("Presence of OPENDOOR in last 10 images: ", agent.open_door_incidence_last10)
+        agent.add_main_command(agent.go_to_room_centre)
+        agent.add_main_command(agent.go_to_next_room)
+
+    agent.do_work()
 
     # TODO: Next step: implement not going through a visited door again during exploration.
