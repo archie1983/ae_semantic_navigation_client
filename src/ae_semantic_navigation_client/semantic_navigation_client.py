@@ -131,7 +131,7 @@ class SemanticNavigationClient:
     RC_NAV_PORT = 5557
     PER_NAV_PORT = 5558
     # Images for VPR (Visual Place Recognition)
-    IMGS_TO_KEEP = 20
+    IMGS_TO_KEEP = 40
     IMGS_TO_EMBED = 10
 
     def __init__(self, jetson_ip, habitat_id = 78):
@@ -182,6 +182,8 @@ class SemanticNavigationClient:
         # A queue to hold pending remedy functions
         self.remedy_commands = deque()
         self.main_commands = deque()
+
+        self.door_transitions_stored = 0
 
     def reset_seen_objs(self):
         self.objs_in_current_room = set()
@@ -318,14 +320,15 @@ class SemanticNavigationClient:
         # TODO: Store images from earlier in the sequence so that we detect coming transition earlier and also to make it more distinct
         # TODO: Consider querying on a smaller set of images to avoid extra data in them
         # TODO: Implement SNP interuption when wrong door is approached
-        #if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:#self.IMGS_TO_EMBED:
-        if room_transition_spotted:
+        if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:#self.IMGS_TO_EMBED:
+        #if room_transition_spotted:
             #imgs_to_embed = self.fpv_images_last_x[5:]
-            imgs_to_embed = self.fpv_images_last_x[:self.IMGS_TO_EMBED]  # get last images
+            imgs_to_embed = self.fpv_images_last_x[-5:]  # get last images -- self.IMGS_TO_EMBED
             qry_result = self.qry_door_transition(np.stack(imgs_to_embed))
-            #print("AE: IMG QUERY: ", qry_result)
+            if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0:
+                print("AE: IMG QUERY: ", qry_result['qry_results'][0], " imgs_cnt: ", len(imgs_to_embed))
 
-            if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] > 0.82:
+            if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] >= 0.92:
                 best_match = qry_result['qry_results'][0]
                 print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, conf = {qry_result['qry_results'][0]['similarity']}")
                 self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
@@ -480,7 +483,8 @@ class SemanticNavigationClient:
         }
 
         ## debug
-        path_id = room_from.name + "_to_" + room_to.name
+        self.door_transitions_stored += 1
+        path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored)
         os.makedirs(path_id, exist_ok=True)
         cnt = 0
         print("STORING ", len(path_imgs), " images.")
