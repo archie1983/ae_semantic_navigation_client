@@ -6,6 +6,8 @@ from scene_navigator import SceneNavigator
 from ai2_thor_model_training import index_to_action
 from ae_llm_navigation_decisions import RoomType
 from collections import Counter
+from enum import Enum
+from collections import deque
 
 class ActionGenerator:
     def __init__(self, dreamer_socket):
@@ -117,6 +119,12 @@ class ActionGenerator:
 
         return next_move_str
 
+class SNPType(Enum):
+    NONE = 0
+    ROOM_CENTRE_FINDER = 1
+    DOOR_FINDER = 2
+    PERIMETER_WALKER = 3
+
 class SemanticNavigationClient:
     LLM_PORT = 5555
     DR_NAV_PORT = 5556
@@ -169,6 +177,8 @@ class SemanticNavigationClient:
         self.current_room_type = RoomType.NOT_KNOWN
         self.prev_room_type = RoomType.NOT_KNOWN
         self.objects_by_room = dict()
+
+        self.current_active_SNP = SNPType.NONE
 
     def reset_seen_objs(self):
         self.objs_in_current_room = set()
@@ -304,17 +314,29 @@ class SemanticNavigationClient:
         # TODO: Raise the threshold from 75% to at least 85%
         # TODO: Store images from earlier in the sequence so that we detect coming transition earlier and also to make it more distinct
         # TODO: Consider querying on a smaller set of images to avoid extra data in them
-        if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > self.IMGS_TO_EMBED:
-            imgs_to_embed = self.fpv_images_last_x[self.IMGS_TO_EMBED:]  # get 5 last images
+        # TODO: Implement SNP interuption when wrong door is approached
+        #if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:#self.IMGS_TO_EMBED:
+        if room_transition_spotted:
+            #imgs_to_embed = self.fpv_images_last_x[5:]
+            imgs_to_embed = self.fpv_images_last_x[:self.IMGS_TO_EMBED]  # get last images
             qry_result = self.qry_door_transition(np.stack(imgs_to_embed))
             #print("AE: IMG QUERY: ", qry_result)
 
-            if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] > 0.75:
+            if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] > 0.82:
                 best_match = qry_result['qry_results'][0]
                 print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, conf = {qry_result['qry_results'][0]['similarity']}")
+                self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
 
         if room_transition_spotted:
             print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
+
+    def callback_from_interrupted_snp(self):
+        print("AE: SNP INTERRUPTED AND SCENE NAVIGATOR CALLED BACK. SNP interrupted: ", self.current_active_SNP)
+        # if we interrupted a door walker, then we probably want to go back to the room centre, but we can't launch
+        # that SNP directly from here because this interrupt function needs to exit so that self.scene_navigator.navigate_to_goal()
+        # can complete and set self.current_active_SNP to NONE and only then we should launch the new SNP.
+        if self.current_active_SNP == SNPType.DOOR_FINDER:
+            pass
 
     def process_incoming_image_rc(self, pil_image):
         '''
@@ -404,7 +426,9 @@ class SemanticNavigationClient:
         """
         self.rc_action_gen.set_image_receiver(self.process_incoming_image_rc)
         self.scene_navigator.set_action_gen(self.rc_action_gen)
+        self.current_active_SNP = SNPType.ROOM_CENTRE_FINDER
         self.scene_navigator.navigate_to_goal()
+        self.current_active_SNP = SNPType.NONE
 
     def go_to_next_room(self):
         """
@@ -413,7 +437,9 @@ class SemanticNavigationClient:
         """
         self.dr_action_gen.set_image_receiver(self.process_incoming_image_dr)
         self.scene_navigator.set_action_gen(self.dr_action_gen)
+        self.current_active_SNP = SNPType.DOOR_FINDER
         self.scene_navigator.navigate_to_goal()
+        self.current_active_SNP = SNPType.NONE
 
     def go_to_perimeter_of_room(self):
         """
@@ -422,7 +448,9 @@ class SemanticNavigationClient:
         """
         self.per_action_gen.set_image_receiver(self.process_incoming_image_per)
         self.scene_navigator.set_action_gen(self.per_action_gen)
+        self.current_active_SNP = SNPType.PERIMETER_WALKER
         self.scene_navigator.navigate_to_goal()
+        self.current_active_SNP = SNPType.NONE
 
     def store_door_transition(self, path_imgs, room_from, room_to):
         """

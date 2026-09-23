@@ -22,6 +22,10 @@ class SceneNavigator:
         self.h_angles = [0, 45, 90, 135, 180, 225, 270, 315]
         self.placements = []
 
+        # If we want to interrupt the work of current SNP, then we'll set this to True
+        self.interrupt = False
+        self.intrp_callback_function = None
+
     def process_required_habitats(self):
         self.process_habitat(10)
         self.controller.stop()
@@ -114,7 +118,7 @@ class SceneNavigator:
     ##
     def navigate_to_goal(self):
         next_move_str = "START"
-        while next_move_str != "STOP":
+        while next_move_str != "STOP" and not self.interrupt:
             # first get the from view image
             event = self.controller.last_event
             img = event.cv2img
@@ -128,6 +132,17 @@ class SceneNavigator:
             else:
                 self.rnc.execute_action(next_move_str, moveMagnitude=self.grid_size, grid_size=self.grid_size,
                                         adhere_to_grid=True)
+
+        # If we had to interrupt, then reset the interupt and clean up action generator
+        if self.interrupt:
+            self.action_generator.stop_received() # or just self.action_generator.reset() ?
+            self.interrupt = False
+            if self.intrp_callback_function is not None:
+                self.intrp_callback_function()
+
+    def interrupt_navigation(self, intrp_callback_function = None):
+        self.interrupt = True
+        self.intrp_callback_function = intrp_callback_function
 
 class TestActionGenerator:
     def __init__(self):
