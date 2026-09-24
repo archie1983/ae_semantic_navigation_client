@@ -1,4 +1,4 @@
-import zmq, glob, re
+import zmq, glob, re, random
 import numpy as np
 import time, cv2, os
 from PIL import Image
@@ -119,11 +119,38 @@ class ActionGenerator:
 
         return next_move_str
 
+class RandomRotationActionGen(ActionGenerator):
+    '''
+    A very simple action generator- it just generates a series of rotations to change the FPV of the agent to a random direction
+    and then unloads the generated actions one by one when called.
+    '''
+    def __init__(self):
+        # which direction
+        rotate_direction = bool(random.randint(0, 1))
+        # how many steps (1 step = 45 degrees)
+        step_cnt = random.randint(1, 4)
+        self.actions = ['RotateRight' if rotate_direction else 'RotateLeft' for i in range(step_cnt)]
+
+    def __call__(self, ai2_thor_image):
+        if self.actions:
+            next_move_str = self.actions.pop(0) # here we just extract commands that we generated earlier
+        else:
+            next_move_str = "STOP"
+        return next_move_str
+
+    # Overriding unused functions to do nothing
+    def reset(self): pass
+    def stop_received(self): pass
+    def normal_op(self): pass
+    def handshake(self): pass
+    def set_image_receiver(self, image_receiver): pass
+
 class SNPType(Enum):
     NONE = 0
     ROOM_CENTRE_FINDER = 1
     DOOR_FINDER = 2
     PERIMETER_WALKER = 3
+    RANDOM_ROTATOR = 4
 
 class SemanticNavigationClient:
     LLM_PORT = 5555
@@ -160,6 +187,7 @@ class SemanticNavigationClient:
         self.rc_action_gen = ActionGenerator(self.rc_socket)
         self.dr_action_gen = ActionGenerator(self.dr_socket)
         self.per_action_gen = ActionGenerator(self.per_socket)
+        self.rr_action_gen = RandomRotationActionGen()
         self.scene_navigator = SceneNavigator(self.rc_action_gen)
 
         # load a certain habitat
@@ -344,7 +372,8 @@ class SemanticNavigationClient:
         if self.current_active_SNP == SNPType.DOOR_FINDER:
             # Instead of calling it, push the function reference to our queue
             print("AE: Enqueuing remedy actions...")
-            self.remedy_commands.append(self.go_to_room_centre)
+            #self.remedy_commands.append(self.go_to_room_centre)
+            self.remedy_commands.append(self.do_random_rotation)
             self.remedy_commands.append(self.go_to_next_room)
 
     def process_incoming_image_rc(self, pil_image):
@@ -458,6 +487,16 @@ class SemanticNavigationClient:
         self.per_action_gen.set_image_receiver(self.process_incoming_image_per)
         self.scene_navigator.set_action_gen(self.per_action_gen)
         self.current_active_SNP = SNPType.PERIMETER_WALKER
+        self.scene_navigator.navigate_to_goal()
+        self.current_active_SNP = SNPType.NONE
+
+    def do_random_rotation(self):
+        """
+        Just rotate in place (yaw) either left or right anything between 45 and 180 degrees.
+        :return:
+        """
+        self.scene_navigator.set_action_gen(self.rr_action_gen)
+        self.current_active_SNP = SNPType.RANDOM_ROTATOR
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
 
