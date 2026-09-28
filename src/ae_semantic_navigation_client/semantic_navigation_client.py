@@ -65,6 +65,27 @@ class ActionGenerator:
 
         # preparing 2 size images: 64x64 for DreamerV3 models and 600x600 or 640x640 whatever AI2-Thor launcher
         # is configured with for YOLO models.
+        rgb_img_large = cv2.cvtColor(ai2_thor_image, cv2.COLOR_BGR2RGB)
+        pil_image_large = Image.fromarray(rgb_img_large)
+
+        if self.image_receiver is not None:
+            bbox_to_cover = self.image_receiver(pil_image_large)
+            self.last_image_large = pil_image_large
+
+        # If we got back bbox_to_cover then we need to ablate that in the image before passing back to the SNP
+        if bbox_to_cover is not None:
+            # bbox expected format: [xmin, ymin, xmax, ymax]
+            xmin, ymin, xmax, ymax = map(int, bbox_to_cover)
+
+            # Paint a solid neutral grey polygon (128, 128, 128) over the door
+            cv2.rectangle(
+                ai2_thor_image,
+                (xmin, ymin),
+                (xmax, ymax),
+                (128, 128, 128),
+                thickness=-1  # -1 fills the interior entirely
+            )
+
         # Resize to 64 x 64
         img_64x64 = cv2.resize(
             ai2_thor_image,
@@ -75,12 +96,6 @@ class ActionGenerator:
         rgb_img_64x64 = cv2.cvtColor(img_64x64, cv2.COLOR_BGR2RGB)
         pil_image_64x64 = Image.fromarray(rgb_img_64x64)
 
-        rgb_img_large = cv2.cvtColor(ai2_thor_image, cv2.COLOR_BGR2RGB)
-        pil_image_large = Image.fromarray(rgb_img_large)
-
-        if self.image_receiver is not None:
-            self.image_receiver(pil_image_large)
-            self.last_image_large = pil_image_large
         # image received, it now needs to be sent to a Dreamer model running on Jetson,
         # which will return an action. The action will then have to be returned from here
         # so that it can be executed in the simulation.
@@ -125,6 +140,9 @@ class RandomRotationActionGen(ActionGenerator):
     and then unloads the generated actions one by one when called.
     '''
     def __init__(self):
+        self.regen_actions()
+
+    def regen_actions(self):
         # which direction
         rotate_direction = bool(random.randint(0, 1))
         # how many steps (1 step = 45 degrees)
@@ -221,6 +239,7 @@ class SemanticNavigationClient:
 
     def reset_last_pics(self):
         self.fpv_images_last_x = []
+        self.open_door_track_ids_last_x = []
 
     def reset_last_room_type_identifations(self):
         self.room_type_id_last10 = []
@@ -228,7 +247,8 @@ class SemanticNavigationClient:
 
     def process_incoming_image(self, pil_image):
         '''
-        Receive an image on every step during an SNP work - steps that we need to take for all SNPs
+        Receive an image on every step during an SNP work - steps that we need to take for all SNPs.
+        Basically pass it to YOLO to check what's in it and detect room type and so on.
         :param pil_image:
         :return:
         '''
@@ -283,22 +303,28 @@ class SemanticNavigationClient:
                 # else:
                 #     print("AE: most_common_room: ", most_common_room, " count: ", count)
 
+        # if we have an open door, then remember that
+        #self.detect_open_door_in_image(pil_image)
+        if "OPENDOOR" in objs_in_image:
+            self.open_door_incidence_last10.append(True)
+            # if we have detected an OPENDOOR, then we also want to know the tracking IDs for these doors so that we can
+            # later block them out if needed. We will be clearing this collection out together with self.fpv_images_last_x.
+            door_track_ids = [item['track_id'] for item in item_infos if item['name'] == 'OPENDOOR']
+            self.open_door_track_ids_last_x.append(door_track_ids)
+        else:
+            self.open_door_incidence_last10.append(False)
+            self.open_door_track_ids_last_x.append([])
+
+        if len(self.open_door_incidence_last10) > 10:
+            #self.open_door_incidence_last10 = self.open_door_incidence_last10[1:]
+            self.open_door_incidence_last10.pop(0)
+
         # store FPVs
         self.fpv_images_last_x.append(pil_image)
         if len(self.fpv_images_last_x) > self.IMGS_TO_KEEP:
             #self.fpv_images_last_x = self.fpv_images_last_x[1:]
             self.fpv_images_last_x.pop(0)
-
-        # if we have an open door, then remember that
-        #self.detect_open_door_in_image(pil_image)
-        if "OPENDOOR" in objs_in_image:
-            self.open_door_incidence_last10.append(True)
-        else:
-            self.open_door_incidence_last10.append(False)
-
-        if len(self.open_door_incidence_last10) > 10:
-            #self.open_door_incidence_last10 = self.open_door_incidence_last10[1:]
-            self.open_door_incidence_last10.pop(0)
+            self.open_door_track_ids_last_x.pop(0)
 
         # If room transition spotted, then we want to manage objects seen in the previous room
         if room_transition_spotted:
@@ -343,11 +369,6 @@ class SemanticNavigationClient:
         # let's try to ID the room.
         item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted = self.process_incoming_image(pil_image)
 
-        # TODO: If opendoor incidence getting high, then start querying the door imagery:
-        # TODO: Raise the threshold from 75% to at least 85%
-        # TODO: Store images from earlier in the sequence so that we detect coming transition earlier and also to make it more distinct
-        # TODO: Consider querying on a smaller set of images to avoid extra data in them
-        # TODO: Implement SNP interuption when wrong door is approached
         if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:#self.IMGS_TO_EMBED:
         #if room_transition_spotted:
             #imgs_to_embed = self.fpv_images_last_x[5:]
@@ -361,8 +382,23 @@ class SemanticNavigationClient:
                 print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, conf = {qry_result['qry_results'][0]['similarity']}")
                 self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
 
+            ## TODO: Here we now need to track the past x images with doors in them and I guess find the prevalent track_id of opendoors objects in the recent
+            # history. And then mark that ID as the forbidden door so that we can paint the grey box over ir.
+            track_id_history_of_interest = self.open_door_track_ids_last_x[-5:]
+            # flatten our list of lists
+            track_ids_flat = sum(track_id_history_of_interest, [])
+            track_id_counts = Counter(track_ids_flat)
+            most_common_track_id, count = track_id_counts.most_common(1)[0]
+            # TODO: this is the forbidden door: most_common_track_id
+            bbox_to_cover = None
+            for item in item_infos:
+                if item['track_id'] == most_common_track_id and item['name'] == 'OPENDOOR':
+                    bbox_to_cover = item['bbox']
+
         if room_transition_spotted:
             print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
+
+        return bbox_to_cover
 
     def callback_from_interrupted_snp(self):
         print("AE: SNP INTERRUPTED AND SCENE NAVIGATOR CALLED BACK. Current active: ", self.current_active_SNP)
@@ -496,6 +532,7 @@ class SemanticNavigationClient:
         :return:
         """
         self.scene_navigator.set_action_gen(self.rr_action_gen)
+        self.rr_action_gen.regen_actions()
         self.current_active_SNP = SNPType.RANDOM_ROTATOR
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
