@@ -23,6 +23,7 @@ class ActionGenerator:
         self.handshake_received = False
         self.image_receiver = None
         self.last_image_large = None
+        self.img_cnt = 0
 
     def reset(self):
         self._cur_obs["is_first"] = True
@@ -95,6 +96,13 @@ class ActionGenerator:
 
         rgb_img_64x64 = cv2.cvtColor(img_64x64, cv2.COLOR_BGR2RGB)
         pil_image_64x64 = Image.fromarray(rgb_img_64x64)
+
+        ## debug
+        path_id = "masked_doors"
+        os.makedirs(path_id, exist_ok=True)
+        self.img_cnt += 1
+        cv2.imwrite(os.path.join(path_id, str(self.img_cnt) + ".png"), pil_image_64x64)
+        ## /debug
 
         # image received, it now needs to be sent to a Dreamer model running on Jetson,
         # which will return an action. The action will then have to be returned from here
