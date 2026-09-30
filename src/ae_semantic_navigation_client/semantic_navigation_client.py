@@ -25,9 +25,14 @@ class ActionGenerator:
         self.last_image_large = None
         self.img_cnt = 0
 
+        # Sometimes we will need to interrupt the SNP and send a reset signal to DreamerV3 model. The reset condition
+        # might persist, but we don't want to keep sending the reset signals. This variable will help with that.
+        self.steps_after_reset = 0
+
     def reset(self):
         self._cur_obs["is_first"] = True
         self._cur_obs["is_last"] = False
+        self.steps_after_reset = 0
 
     def stop_received(self):
         self._cur_obs["is_first"] = False
@@ -64,6 +69,10 @@ class ActionGenerator:
     def __call__(self, ai2_thor_image):
         self.handshake()
 
+        bbox_to_cover = None
+        # Create a working copy so we don't permanently alter the simulation telemetry frame
+        processed_image = ai2_thor_image.copy()
+
         # preparing 2 size images: 64x64 for DreamerV3 models and 600x600 or 640x640 whatever AI2-Thor launcher
         # is configured with for YOLO models.
         rgb_img_large = cv2.cvtColor(ai2_thor_image, cv2.COLOR_BGR2RGB)
@@ -76,33 +85,54 @@ class ActionGenerator:
         # If we got back bbox_to_cover then we need to ablate that in the image before passing back to the SNP
         if bbox_to_cover is not None:
             # bbox expected format: [xmin, ymin, xmax, ymax]
-            xmin, ymin, xmax, ymax = map(int, bbox_to_cover)
+            #xmin, ymin, xmax, ymax = map(int, bbox_to_cover)
 
             # Paint a solid neutral grey polygon (128, 128, 128) over the door
+            # cv2.rectangle(
+            #     processed_image,
+            #     (xmin, ymin),
+            #     (xmax, ymax),
+            #     (128, 128, 128),
+            #     thickness=-1  # -1 fills the interior entirely
+            # )
+
+            print("AE: painting BLOCKING bbox_to_cover: ", bbox_to_cover, " shape: ", processed_image.shape)
             cv2.rectangle(
-                ai2_thor_image,
-                (xmin, ymin),
-                (xmax, ymax),
+                processed_image,
+                (0, 0),
+                (600, 600),
                 (128, 128, 128),
                 thickness=-1  # -1 fills the interior entirely
             )
 
-        # Resize to 64 x 64
-        img_64x64 = cv2.resize(
-            ai2_thor_image,
-            (64, 64),
-            interpolation=cv2.INTER_LANCZOS4  # High quality
-        )
+            # Resize to 64 x 64
+            img_64x64 = cv2.resize(
+                processed_image,
+                (64, 64),
+                interpolation=cv2.INTER_LANCZOS4  # High quality
+            )
+
+            if self.steps_after_reset >= 10:
+                self.reset()
+
+        else:
+            # Resize to 64 x 64
+            img_64x64 = cv2.resize(
+                ai2_thor_image,
+                (64, 64),
+                interpolation=cv2.INTER_LANCZOS4  # High quality
+            )
 
         rgb_img_64x64 = cv2.cvtColor(img_64x64, cv2.COLOR_BGR2RGB)
         pil_image_64x64 = Image.fromarray(rgb_img_64x64)
 
-        ## debug
-        path_id = "masked_doors"
-        os.makedirs(path_id, exist_ok=True)
-        self.img_cnt += 1
-        cv2.imwrite(os.path.join(path_id, str(self.img_cnt) + ".png"), pil_image_64x64)
-        ## /debug
+        if bbox_to_cover is not None:
+            ## debug
+            path_id = "masked_doors"
+            os.makedirs(path_id, exist_ok=True)
+            self.img_cnt += 1
+            cv2.imwrite(os.path.join(path_id, str(self.img_cnt) + ".png"), rgb_img_64x64)
+            ## /debug
 
         # image received, it now needs to be sent to a Dreamer model running on Jetson,
         # which will return an action. The action will then have to be returned from here
@@ -122,6 +152,7 @@ class ActionGenerator:
         # Wait for response (this BLOCKS until Jetson replies)
         try:
             response = self.socket.recv_pyobj()
+            self.steps_after_reset += 1
         except zmq.ZMQError as e:
             print(f"Error receiving response: {e}")
             response = None
@@ -133,6 +164,7 @@ class ActionGenerator:
         # a observation with is_last = True. If however this is the very first image after loading a scene, then we
         # need to set is_first = True.
 
+        #print("AE AG : .socket = ", self.socket, " @@ response = ", response)
         if next_move_str == "STOP":
             self.stop_received()
         elif response['action_bits']['reset']:
@@ -377,6 +409,8 @@ class SemanticNavigationClient:
         # let's try to ID the room.
         item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted = self.process_incoming_image(pil_image)
 
+        bbox_to_cover = None
+
         if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:#self.IMGS_TO_EMBED:
         #if room_transition_spotted:
             #imgs_to_embed = self.fpv_images_last_x[5:]
@@ -388,20 +422,21 @@ class SemanticNavigationClient:
             if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] >= 0.92:
                 best_match = qry_result['qry_results'][0]
                 print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, conf = {qry_result['qry_results'][0]['similarity']}")
-                self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                #self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
 
-            ## TODO: Here we now need to track the past x images with doors in them and I guess find the prevalent track_id of opendoors objects in the recent
-            # history. And then mark that ID as the forbidden door so that we can paint the grey box over ir.
-            track_id_history_of_interest = self.open_door_track_ids_last_x[-5:]
-            # flatten our list of lists
-            track_ids_flat = sum(track_id_history_of_interest, [])
-            track_id_counts = Counter(track_ids_flat)
-            most_common_track_id, count = track_id_counts.most_common(1)[0]
-            # TODO: this is the forbidden door: most_common_track_id
-            bbox_to_cover = None
-            for item in item_infos:
-                if item['track_id'] == most_common_track_id and item['name'] == 'OPENDOOR':
-                    bbox_to_cover = item['bbox']
+                # Here we now need to track the past x images with doors in them and I guess find the prevalent track_id of opendoors objects in the recent
+                # history. And then mark that ID as the forbidden door so that we can paint the grey box over ir.
+                track_id_history_of_interest = self.open_door_track_ids_last_x[-5:]
+                # flatten our list of lists
+                track_ids_flat = sum(track_id_history_of_interest, [])
+                track_id_counts = Counter(track_ids_flat)
+                most_common_track_id, count = track_id_counts.most_common(1)[0]
+                # TODO: this is the forbidden door: most_common_track_id
+                for item in item_infos:
+                    if item['track_id'] == most_common_track_id and item['name'] == 'OPENDOOR':
+                        bbox_to_cover = item['bbox']
+                if bbox_to_cover == []: bbox_to_cover = None
+                bbox_to_cover = True
 
         if room_transition_spotted:
             print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
@@ -416,6 +451,13 @@ class SemanticNavigationClient:
         if self.current_active_SNP == SNPType.DOOR_FINDER:
             # Instead of calling it, push the function reference to our queue
             print("AE: Enqueuing remedy actions...")
+            # TODO: consider door finding task to be a sequence of perimeter SNP until we see a door + door finder
+            #  instead of just door finder SNP alone. That should allow for discovery of other doors after we've reset
+            #  the RSSM state with the is_first flag.
+            #
+            # TODO: Introduce two levels of transition recognition - the one that we already have (let's call it the
+            #  immediate one) and another one- earlier (call it early one). If we have an immediate transition in front,
+            #  then blat out whole screen. If the early one, then only blat out the door and still reset SNP.
             #self.remedy_commands.append(self.go_to_room_centre)
             self.remedy_commands.append(self.do_random_rotation)
             self.remedy_commands.append(self.go_to_next_room)
