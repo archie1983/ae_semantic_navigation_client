@@ -79,31 +79,38 @@ class ActionGenerator:
         pil_image_large = Image.fromarray(rgb_img_large)
 
         if self.image_receiver is not None:
-            bbox_to_cover = self.image_receiver(pil_image_large)
+            vpr_info = self.image_receiver(pil_image_large)
+            if vpr_info is not None:
+                bbox_to_cover, early_or_late = vpr_info
+            else:
+                bbox_to_cover = None
+                early_or_late = None
             self.last_image_large = pil_image_large
-
+        # TODO: implement analysis of early_or_late
         # If we got back bbox_to_cover then we need to ablate that in the image before passing back to the SNP
         if bbox_to_cover is not None:
-            # bbox expected format: [xmin, ymin, xmax, ymax]
-            #xmin, ymin, xmax, ymax = map(int, bbox_to_cover)
-
-            # Paint a solid neutral grey polygon (128, 128, 128) over the door
-            # cv2.rectangle(
-            #     processed_image,
-            #     (xmin, ymin),
-            #     (xmax, ymax),
-            #     (128, 128, 128),
-            #     thickness=-1  # -1 fills the interior entirely
-            # )
-
-            print("AE: painting BLOCKING bbox_to_cover: ", bbox_to_cover, " shape: ", processed_image.shape)
-            cv2.rectangle(
-                processed_image,
-                (0, 0),
-                (600, 600),
-                (128, 128, 128),
-                thickness=-1  # -1 fills the interior entirely
-            )
+            # if this is an early detection, then just paint over the doors
+            if early_or_late:
+                print("AE: painting DOOR only bbox_to_cover: ", bbox_to_cover, " shape: ", processed_image.shape)
+                # bbox expected format: [xmin, ymin, xmax, ymax]
+                xmin, ymin, xmax, ymax = map(int, bbox_to_cover)
+                # Paint a solid neutral grey polygon (128, 128, 128) over the door
+                # cv2.rectangle(
+                #     processed_image,
+                #     (xmin, ymin),
+                #     (xmax, ymax),
+                #     (128, 128, 128),
+                #     thickness=-1  # -1 fills the interior entirely
+                # )
+            else: # otherwise blank out all
+                print("AE: painting BLOCKING bbox_to_cover: ", bbox_to_cover, " shape: ", processed_image.shape)
+                cv2.rectangle(
+                    processed_image,
+                    (0, 0),
+                    (600, 600),
+                    (128, 128, 128),
+                    thickness=-1  # -1 fills the interior entirely
+                )
 
             # Resize to 64 x 64
             img_64x64 = cv2.resize(
@@ -216,8 +223,10 @@ class SemanticNavigationClient:
     RC_NAV_PORT = 5557
     PER_NAV_PORT = 5558
     # Images for VPR (Visual Place Recognition)
-    IMGS_TO_KEEP = 40
+    IMGS_TO_KEEP = 100
     IMGS_TO_EMBED = 10
+    IMG_HISTORY_FOR_IMM_VPR = 40 # how long in the past to look if we want to store immediate door transition (we're close to the door).
+    IMG_HISTORY_FOR_EARLY_VPR = 60 # ditto, but for early VPR (when we're only approaching)
 
     def __init__(self, jetson_ip, habitat_id = 78):
         self.context = zmq.Context()
@@ -351,6 +360,9 @@ class SemanticNavigationClient:
             # later block them out if needed. We will be clearing this collection out together with self.fpv_images_last_x.
             door_track_ids = [item['track_id'] for item in item_infos if item['name'] == 'OPENDOOR']
             self.open_door_track_ids_last_x.append(door_track_ids)
+
+
+
         else:
             self.open_door_incidence_last10.append(False)
             self.open_door_track_ids_last_x.append([])
@@ -380,8 +392,14 @@ class SemanticNavigationClient:
             #
             # For now let's detect all transitions regardless of doors.
             #if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:
-                imgs_to_embed = self.fpv_images_last_x[:self.IMGS_TO_EMBED]  # Or save the mid-point transition images
-                self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type)
+                #imgs_to_embed = self.fpv_images_last_x[:self.IMGS_TO_EMBED]  # Or save the mid-point transition images
+                imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_IMM_VPR:][:self.IMGS_TO_EMBED] # take first 10 images from the history of 40 back
+                self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, False)
+
+                # now let's see if we have enough imagery for an early transition storage
+                if len(self.fpv_images_last_x) >= self.IMG_HISTORY_FOR_EARLY_VPR:
+                    imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_EARLY_VPR:][:self.IMGS_TO_EMBED]  # take first 10 images from the history of 40 back
+                    self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, True)
 
         # collect seen objects for this room type (or room)
         self.objs_in_current_room = self.objs_in_current_room.union(objs_in_image)
@@ -409,7 +427,7 @@ class SemanticNavigationClient:
         # let's try to ID the room.
         item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted = self.process_incoming_image(pil_image)
 
-        bbox_to_cover = None
+        result = (None, None)
 
         if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:#self.IMGS_TO_EMBED:
         #if room_transition_spotted:
@@ -421,7 +439,7 @@ class SemanticNavigationClient:
 
             if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] >= 0.92:
                 best_match = qry_result['qry_results'][0]
-                print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, conf = {qry_result['qry_results'][0]['similarity']}")
+                print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, early_or_late: {best_match['early_or_late']}, conf = {qry_result['qry_results'][0]['similarity']}")
                 #self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
 
                 # Here we now need to track the past x images with doors in them and I guess find the prevalent track_id of opendoors objects in the recent
@@ -431,17 +449,19 @@ class SemanticNavigationClient:
                 track_ids_flat = sum(track_id_history_of_interest, [])
                 track_id_counts = Counter(track_ids_flat)
                 most_common_track_id, count = track_id_counts.most_common(1)[0]
-                # TODO: this is the forbidden door: most_common_track_id
+
+                # this is the forbidden door: most_common_track_id
+                bbox_to_cover = None
                 for item in item_infos:
                     if item['track_id'] == most_common_track_id and item['name'] == 'OPENDOOR':
                         bbox_to_cover = item['bbox']
                 if bbox_to_cover == []: bbox_to_cover = None
-                bbox_to_cover = True
+                result = (bbox_to_cover, best_match['early_or_late'])
 
         if room_transition_spotted:
             print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
 
-        return bbox_to_cover
+        return result
 
     def callback_from_interrupted_snp(self):
         print("AE: SNP INTERRUPTED AND SCENE NAVIGATOR CALLED BACK. Current active: ", self.current_active_SNP)
@@ -587,12 +607,17 @@ class SemanticNavigationClient:
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
 
-    def store_door_transition(self, path_imgs, room_from, room_to):
+    def store_door_transition(self, path_imgs, room_from, room_to, early_or_late):
         """
         Send an a collection of images, representing a door entrance, to server.
 
         Args:
-            image_np: numpy array (x, H, W, C) in BGR order (typical from OpenCV/AI2-THOR)
+
+        :param path_imgs:
+        :param room_from:
+        :param room_to:
+        :param early_or_late: is this an early (door still quite far) or late (already going through) VPR for a door transition
+        :return:
 
         Returns:
             success flag or None if error
@@ -604,16 +629,17 @@ class SemanticNavigationClient:
             'bytes': path_imgs.tobytes(),
             'room_from': room_from.name,
             'room_to': room_to.name,
+            'early_or_late': early_or_late,
             'action': "store_door_transition",
             'module': "path_comparator"
         }
 
         ## debug
         self.door_transitions_stored += 1
-        path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored)
+        path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored) + "_" + ('EARLY' if early_or_late else 'IMM')
         os.makedirs(path_id, exist_ok=True)
         cnt = 0
-        print("STORING ", len(path_imgs), " images.")
+        print("STORING ", len(path_imgs), " images. early_or_late = ", early_or_late)
         for img in path_imgs:
             cnt += 1
             cv2.imwrite(os.path.join(path_id, str(cnt) + ".png"), img)
@@ -739,9 +765,27 @@ class SemanticNavigationClient:
         # Small delay to avoid overwhelming the system
         time.sleep(0.05)
 
+    def crop_bbox_from_pil(pil_image, bbox):
+        """
+        Crops an image segment (usually a door) out of a PIL Image instance.
+
+        Args:
+            pil_image: PIL.Image object
+            bbox: Flat list [xmin, ymin, xmax, ymax]
+        Returns:
+            cropped_pil_image: A new cropped PIL Image object
+        """
+        # Unpack and cast to integers
+        xmin, ymin, xmax, ymax = map(int, bbox)
+
+        # PIL handles boundary safety internally, returning blank space if out-of-bounds
+        cropped_pil_image = pil_image.crop((xmin, ymin, xmax, ymax))
+
+        return cropped_pil_image
+
     def detect_objects_in_image(self, img):
         """
-        Send an a collection of images, representing a reference path, to server.
+        Send a collection of images, representing a reference path, to server.
 
         Args:
             image_np: numpy array (x, H, W, C) in BGR order (typical from OpenCV/AI2-THOR)
