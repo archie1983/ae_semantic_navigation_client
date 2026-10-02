@@ -95,13 +95,13 @@ class ActionGenerator:
                 # bbox expected format: [xmin, ymin, xmax, ymax]
                 xmin, ymin, xmax, ymax = map(int, bbox_to_cover)
                 # Paint a solid neutral grey polygon (128, 128, 128) over the door
-                # cv2.rectangle(
-                #     processed_image,
-                #     (xmin, ymin),
-                #     (xmax, ymax),
-                #     (128, 128, 128),
-                #     thickness=-1  # -1 fills the interior entirely
-                # )
+                cv2.rectangle(
+                    processed_image,
+                    (xmin, ymin),
+                    (xmax, ymax),
+                    (128, 128, 128),
+                    thickness=-1  # -1 fills the interior entirely
+                )
             else: # otherwise blank out all
                 print("AE: painting BLOCKING bbox_to_cover: ", bbox_to_cover, " shape: ", processed_image.shape)
                 cv2.rectangle(
@@ -267,6 +267,7 @@ class SemanticNavigationClient:
         self.reset_open_door_incidence()
         self.reset_last_pics()
         self.reset_last_room_type_identifations()
+        self.reset_doors_in_current_transition_run()
 
         self.common_objs = {'OPENDOOR', 'CLOSEDDOOR', 'FLOOR'}
         self.current_room_type = RoomType.NOT_KNOWN
@@ -289,6 +290,20 @@ class SemanticNavigationClient:
     def reset_last_pics(self):
         self.fpv_images_last_x = []
         self.open_door_track_ids_last_x = []
+
+    def reset_doors_in_current_transition_run(self):
+        self.doors_in_current_transition_run = []
+
+    def add_door_in_current_transition_run(self, track_id, bbox, door_pic):
+        """
+        When we transit to a different room, we want to have a good set of doors that lead us there. This collection
+        will allow tracking them.
+        :param track_id: YOLO track_id
+        :param bbox: bbox from the original image might be useful to infer the size of the door or distance to it
+        :param door_pic: cropped door
+        :return:
+        """
+        self.doors_in_current_transition_run.append({'track_id': track_id, 'bbox': bbox, 'door_pic': door_pic})
 
     def reset_last_room_type_identifations(self):
         self.room_type_id_last10 = []
@@ -360,9 +375,6 @@ class SemanticNavigationClient:
             # later block them out if needed. We will be clearing this collection out together with self.fpv_images_last_x.
             door_track_ids = [item['track_id'] for item in item_infos if item['name'] == 'OPENDOOR']
             self.open_door_track_ids_last_x.append(door_track_ids)
-
-
-
         else:
             self.open_door_incidence_last10.append(False)
             self.open_door_track_ids_last_x.append([])
@@ -384,9 +396,7 @@ class SemanticNavigationClient:
             # If it is not defined, then assume that we're discovering the room type for the first time and the
             # collected objects need not be erased, but collected for the new room type, which will happen outside this
             # if block.
-            if (not(self.is_room_nonsense(self.prev_room_type) or self.is_room_nonsense(self.current_room_type))):
-                self.reset_seen_objs()
-
+            if not(self.is_room_nonsense(self.prev_room_type)) and not (self.is_room_nonsense(self.current_room_type)):
             # this might be a case of walking through an open plan living room into a kitchen (in which case we won't
             # have a door, or this might be a transition through a door. If it's through a door, then we want to save it
             #
@@ -401,6 +411,16 @@ class SemanticNavigationClient:
                     imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_EARLY_VPR:][:self.IMGS_TO_EMBED]  # take first 10 images from the history of 40 back
                     self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, True)
 
+                # Now that we've stored transition to a new room, let's also store the looks of the door that brought us there
+                most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
+                door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
+
+                # Store door pics to vector DB pertaining to this transition.
+                self.store_door_images_of_transition(door_pics_infos_to_store, self.prev_room_type, self.current_room_type)
+
+                self.reset_seen_objs()
+                self.reset_doors_in_current_transition_run()
+
         # collect seen objects for this room type (or room)
         self.objs_in_current_room = self.objs_in_current_room.union(objs_in_image)
 
@@ -409,6 +429,13 @@ class SemanticNavigationClient:
             self.objects_by_room[self.current_room_type] = self.objs_in_current_room
 
         return item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted
+
+    def do_we_need_to_paint_this_door(self, stored_door_info):
+        if stored_door_info['qry_results'] and len(stored_door_info['qry_results'] > 0) and stored_door_info['qry_results']['similarity'] > 0.8:
+            return True
+        else:
+            print("AE: Stored Door Info: ", stored_door_info)
+            return False
 
     def is_room_nonsense(self, current_room_type):
         if (self.prev_room_type == None
@@ -442,26 +469,60 @@ class SemanticNavigationClient:
                 print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, early_or_late: {best_match['early_or_late']}, conf = {qry_result['qry_results'][0]['similarity']}")
                 #self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
 
-                # Here we now need to track the past x images with doors in them and I guess find the prevalent track_id of opendoors objects in the recent
-                # history. And then mark that ID as the forbidden door so that we can paint the grey box over ir.
-                track_id_history_of_interest = self.open_door_track_ids_last_x[-5:]
-                # flatten our list of lists
-                track_ids_flat = sum(track_id_history_of_interest, [])
-                track_id_counts = Counter(track_ids_flat)
-                most_common_track_id, count = track_id_counts.most_common(1)[0]
+                ## Thhis is the original way to ablate doors
+                # # Here we now need to track the past x images with doors in them and I guess find the prevalent track_id of opendoors objects in the recent
+                # # history. And then mark that ID as the forbidden door so that we can paint the grey box over it.
+                # most_common_track_id = self.most_common_door_track_id_in_recent_history()
+                # # this is the forbidden door: most_common_track_id
+                #
+                # bbox_to_cover = None
+                # for item in item_infos:
+                #     if item['track_id'] == most_common_track_id and item['name'] == 'OPENDOOR':
+                #         bbox_to_cover = item['bbox']
+                # if bbox_to_cover == []: bbox_to_cover = None
+                # result = (bbox_to_cover, best_match['early_or_late'])
 
-                # this is the forbidden door: most_common_track_id
-                bbox_to_cover = None
-                for item in item_infos:
-                    if item['track_id'] == most_common_track_id and item['name'] == 'OPENDOOR':
+        ## This is the new way (note the nesting level):
+        if 'OPENDOOR' in objs_in_image:
+            # If we've spotted an OPENDOOR, then let's store a cropped image of it along with its tracker ID so that later
+            # when we store a door transition, we have a good distribution of what this door looks like from different
+            # angles and distances.
+            for item in item_infos:
+                if item['name'] == 'OPENDOOR':
+                    track_id = item['track_id']
+                    bbox = item['bbox']
+                    door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
+                    self.add_door_in_current_transition_run(track_id, bbox, door_only_pic)
+
+                    # Also, if we've spotted an OPENDOOR, then let's query if this door has been seen from other
+                    # angles and distances.
+                    # query if we already know this door
+                    stored_door_info = self.qry_door_images_of_transition(door_only_pic)
+                    if (self.do_we_need_to_paint_this_door(stored_door_info)):
                         bbox_to_cover = item['bbox']
-                if bbox_to_cover == []: bbox_to_cover = None
-                result = (bbox_to_cover, best_match['early_or_late'])
+                        result = (bbox_to_cover, True)
 
         if room_transition_spotted:
             print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
 
         return result
+
+    def most_common_door_track_id_in_recent_history(self):
+        """
+        Here we now need to track the past x images with doors in them and find the prevalent track_id of opendoors objects in the recent
+        history.
+        :return:
+        """
+        track_id_history_of_interest = self.open_door_track_ids_last_x[-10:]
+
+        # empties_discarded = [item for item in self.open_door_track_ids_last_x if len(item) > 0]
+        # track_id_history_of_interest = empties_discarded[-5:]
+
+        # flatten our list of lists
+        track_ids_flat = sum(track_id_history_of_interest, [])
+        track_id_counts = Counter(track_ids_flat)
+        most_common_track_id, count = track_id_counts.most_common(1)[0]
+        return most_common_track_id
 
     def callback_from_interrupted_snp(self):
         print("AE: SNP INTERRUPTED AND SCENE NAVIGATOR CALLED BACK. Current active: ", self.current_active_SNP)
@@ -606,6 +667,73 @@ class SemanticNavigationClient:
         self.current_active_SNP = SNPType.RANDOM_ROTATOR
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
+
+    def store_door_images_of_transition(self, door_pics_infos_to_store, room_from, room_to):
+        """
+        Store images of the actual doors when transiting from one room to another
+
+        :param door_imgs: images of doors only for fast ID later
+        :param room_from:
+        :param room_to:
+        :return:
+        """
+        door_pics_to_store = np.stack([item[0] for item in door_pics_infos_to_store])
+        door_bboxes_to_store = [item[1] for item in door_pics_infos_to_store]
+
+        data = {
+            'shape': door_pics_to_store.shape,
+            'dtype': str(door_pics_to_store.dtype),
+            'bytes': door_pics_to_store.tobytes(),
+            'room_from': room_from.name,
+            'room_to': room_to.name,
+            'door_bboxes': door_bboxes_to_store,
+            'action': "store_door_pics_of_transition",
+            'module': "path_comparator"
+        }
+
+        ## debug
+        path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored) + "_DOORPICS"
+        os.makedirs(path_id, exist_ok=True)
+        cnt = 0
+        print("STORING ", len(door_pics_to_store), " door pics.")
+        for img in door_pics_to_store:
+            cnt += 1
+            cv2.imwrite(os.path.join(path_id, str(cnt) + ".png"), img)
+        ## /debug
+
+        # Send request
+        self.llm_socket.send_pyobj(data)
+
+        # Wait for response (this BLOCKS until Jetson replies)
+        try:
+            response = self.llm_socket.recv_pyobj()
+            return response
+        except zmq.ZMQError as e:
+            print(f"Error receiving response: {e}")
+            return None
+
+    def qry_door_images_of_transition(self, door_img):
+        door_img = np.stack([door_img])
+
+        # Serialize the images
+        data = {
+            'shape': door_img.shape,
+            'dtype': str(door_img.dtype),
+            'bytes': door_img.tobytes(),
+            'action': "qry_door_pics_of_transition",
+            'module': "path_comparator"
+        }
+
+        # Send request
+        self.llm_socket.send_pyobj(data)
+
+        # Wait for response (this BLOCKS until Jetson replies)
+        try:
+            response = self.llm_socket.recv_pyobj()
+            return response
+        except zmq.ZMQError as e:
+            print(f"Error receiving response: {e}")
+            return None
 
     def store_door_transition(self, path_imgs, room_from, room_to, early_or_late):
         """
