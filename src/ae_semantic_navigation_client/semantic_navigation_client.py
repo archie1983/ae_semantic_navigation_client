@@ -369,15 +369,34 @@ class SemanticNavigationClient:
 
         # if we have an open door, then remember that
         #self.detect_open_door_in_image(pil_image)
+        print("AE: objs_in_image and item_infos at place 1: ", objs_in_image, item_infos)
         if "OPENDOOR" in objs_in_image:
             self.open_door_incidence_last10.append(True)
             # if we have detected an OPENDOOR, then we also want to know the tracking IDs for these doors so that we can
             # later block them out if needed. We will be clearing this collection out together with self.fpv_images_last_x.
             door_track_ids = [item['track_id'] for item in item_infos if item['name'] == 'OPENDOOR']
             self.open_door_track_ids_last_x.append(door_track_ids)
+            print("AE: Adding door_track_ids in self.open_door_track_ids_last_x: ", door_track_ids)
+
+            # If we've spotted an OPENDOOR, then let's store a cropped image of it along with its tracker ID so that later
+            # when we store a door transition, we have a good distribution of what this door looks like from different
+            # angles and distances.
+            # Important: This is different from self.open_door_track_ids_last_x collection in such a way that we will clear
+            # self.doors_in_current_transition_run when transition completes, but self.open_door_track_ids_last_x is a
+            # total running history of door track IDs which we only clear one by one when the buffer is full.
+            # self.doors_in_current_transition_run is for the current transition only (there is always a transition BTW,
+            # because sooner or later we will go through a door).
+            for item in item_infos:
+                if item['name'] == 'OPENDOOR':
+                    track_id = item['track_id']
+                    bbox = item['bbox']
+                    door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
+                    self.add_door_in_current_transition_run(track_id, bbox, door_only_pic)
+                    print("AE: Adding track_id to self.doors_in_current_transition_run : ", track_id)
         else:
             self.open_door_incidence_last10.append(False)
             self.open_door_track_ids_last_x.append([])
+            print("AE: Adding door_track_ids: NONE")
 
         if len(self.open_door_incidence_last10) > 10:
             #self.open_door_incidence_last10 = self.open_door_incidence_last10[1:]
@@ -412,11 +431,18 @@ class SemanticNavigationClient:
                     self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, True)
 
                 # Now that we've stored transition to a new room, let's also store the looks of the door that brought us there
+                # The most commond door track ID in the recent history (something like last 10 images) should be the door that's
+                # lead us to the new room.
                 most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
                 if most_common_door_track_id is not None:
                     door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
                     # Store door pics to vector DB pertaining to this transition.
-                    self.store_door_images_of_transition(door_pics_infos_to_store, self.prev_room_type, self.current_room_type)
+                    if len(door_pics_infos_to_store) > 0:
+                        self.store_door_images_of_transition(door_pics_infos_to_store, self.prev_room_type, self.current_room_type)
+                    else:
+                        # TODO: Remove this branch once we have confirmed that this condition is fixed and does not happen anymore
+                        print("AE: self.doors_in_current_transition_run : ", [item['track_id'] for item in self.doors_in_current_transition_run], " most_common_door_track_id: ", most_common_door_track_id, " self.open_door_track_ids_last_x[-10:]: ", self.open_door_track_ids_last_x[-10:])
+                        exit()
 
                 self.reset_seen_objs()
                 self.reset_doors_in_current_transition_run()
@@ -483,20 +509,16 @@ class SemanticNavigationClient:
                 # result = (bbox_to_cover, best_match['early_or_late'])
 
         ## This is the new way (note the nesting level):
+        print("AE: objs_in_image and item_infos at place 2: ", objs_in_image, item_infos)
         if 'OPENDOOR' in objs_in_image:
-            # If we've spotted an OPENDOOR, then let's store a cropped image of it along with its tracker ID so that later
-            # when we store a door transition, we have a good distribution of what this door looks like from different
-            # angles and distances.
             for item in item_infos:
                 if item['name'] == 'OPENDOOR':
-                    track_id = item['track_id']
                     bbox = item['bbox']
                     door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
-                    self.add_door_in_current_transition_run(track_id, bbox, door_only_pic)
-
-                    # Also, if we've spotted an OPENDOOR, then let's query if this door has been seen from other
+                    # If we've spotted an OPENDOOR, then let's query if this door has been seen from other
                     # angles and distances.
-                    # query if we already know this door
+                    # query if we already know this door. And if we do and it is leading where we don't want to go,
+                    # then paint it.
                     stored_door_info = self.qry_door_images_of_transition(door_only_pic)
                     if (self.do_we_need_to_paint_this_door(stored_door_info)):
                         bbox_to_cover = item['bbox']
@@ -685,6 +707,8 @@ class SemanticNavigationClient:
         serialized_pics = []
         door_bboxes_to_store = []
 
+        #print("AE: door_pics_infos_to_store: ", door_pics_infos_to_store)
+
         for item in door_pics_infos_to_store:
             pil_img = item[0]
             bbox = item[1]
@@ -699,7 +723,7 @@ class SemanticNavigationClient:
             if success:
                 # Store the raw binary bytes, its unique shape, and its bounding box bounds
                 serialized_pics.append({
-                    'bytes': encoded_img.tobytes(),
+                    'bytes': img_np.tobytes(),
                     'shape': img_bgr.shape,  # (H, W, C)
                     'dtype': str(img_bgr.dtype)
                 })
@@ -707,7 +731,7 @@ class SemanticNavigationClient:
 
         # Construct the network structure payload
         data = {
-            'door_pics': serialized_pics,  # Now a list of individual dicts instead of a stacked matrix
+            'door_pics': serialized_pics,
             'room_from': room_from.name,
             'room_to': room_to.name,
             'door_bboxes': door_bboxes_to_store,
@@ -718,7 +742,7 @@ class SemanticNavigationClient:
         ## debug - Keeping your exact diagnostic loop working smoothly
         path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored) + "_DOORPICS"
         os.makedirs(path_id, exist_ok=True)
-        print(f"STORING {len(serialized_pics)} door pics cleanly.")
+        print(f"STORING {len(serialized_pics)} door pics cleanly. shapes: ", [item['shape'] for item in data['door_pics']])
 
         for cnt, item in enumerate(door_pics_infos_to_store, 1):
             img_np = np.array(item[0])
