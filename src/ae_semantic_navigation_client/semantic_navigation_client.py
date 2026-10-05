@@ -413,10 +413,10 @@ class SemanticNavigationClient:
 
                 # Now that we've stored transition to a new room, let's also store the looks of the door that brought us there
                 most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
-                door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
-
-                # Store door pics to vector DB pertaining to this transition.
-                self.store_door_images_of_transition(door_pics_infos_to_store, self.prev_room_type, self.current_room_type)
+                if most_common_door_track_id is not None:
+                    door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
+                    # Store door pics to vector DB pertaining to this transition.
+                    self.store_door_images_of_transition(door_pics_infos_to_store, self.prev_room_type, self.current_room_type)
 
                 self.reset_seen_objs()
                 self.reset_doors_in_current_transition_run()
@@ -520,9 +520,13 @@ class SemanticNavigationClient:
 
         # flatten our list of lists
         track_ids_flat = sum(track_id_history_of_interest, [])
-        track_id_counts = Counter(track_ids_flat)
-        most_common_track_id, count = track_id_counts.most_common(1)[0]
-        return most_common_track_id
+        #print("AE: track_ids_flat == ", track_ids_flat)
+        if len(track_ids_flat) > 0:
+            track_id_counts = Counter(track_ids_flat)
+            most_common_track_id, count = track_id_counts.most_common(1)[0]
+            return most_common_track_id
+        else:
+            return None
 
     def callback_from_interrupted_snp(self):
         print("AE: SNP INTERRUPTED AND SCENE NAVIGATOR CALLED BACK. Current active: ", self.current_active_SNP)
@@ -670,20 +674,40 @@ class SemanticNavigationClient:
 
     def store_door_images_of_transition(self, door_pics_infos_to_store, room_from, room_to):
         """
-        Store images of the actual doors when transiting from one room to another
+        Store images of the actual doors when transiting from one room to another.
+        Serializes each cropped image into its own byte block to handle varying dimensions.
 
         :param door_imgs: images of doors only for fast ID later
         :param room_from:
         :param room_to:
         :return:
         """
-        door_pics_to_store = np.stack([item[0] for item in door_pics_infos_to_store])
-        door_bboxes_to_store = [item[1] for item in door_pics_infos_to_store]
+        serialized_pics = []
+        door_bboxes_to_store = []
 
+        for item in door_pics_infos_to_store:
+            pil_img = item[0]
+            bbox = item[1]
+
+            # 1. Convert the PIL Image into a NumPy array (handling RGB/BGR properly)
+            img_np = np.array(pil_img)
+            #img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            img_bgr = img_np
+
+            # 2. Compress the individual frame into a JPEG memory buffer
+            success, encoded_img = cv2.imencode('.jpg', img_bgr)
+            if success:
+                # Store the raw binary bytes, its unique shape, and its bounding box bounds
+                serialized_pics.append({
+                    'bytes': encoded_img.tobytes(),
+                    'shape': img_bgr.shape,  # (H, W, C)
+                    'dtype': str(img_bgr.dtype)
+                })
+                door_bboxes_to_store.append(bbox)
+
+        # Construct the network structure payload
         data = {
-            'shape': door_pics_to_store.shape,
-            'dtype': str(door_pics_to_store.dtype),
-            'bytes': door_pics_to_store.tobytes(),
+            'door_pics': serialized_pics,  # Now a list of individual dicts instead of a stacked matrix
             'room_from': room_from.name,
             'room_to': room_to.name,
             'door_bboxes': door_bboxes_to_store,
@@ -691,20 +715,21 @@ class SemanticNavigationClient:
             'module': "path_comparator"
         }
 
-        ## debug
+        ## debug - Keeping your exact diagnostic loop working smoothly
         path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored) + "_DOORPICS"
         os.makedirs(path_id, exist_ok=True)
-        cnt = 0
-        print("STORING ", len(door_pics_to_store), " door pics.")
-        for img in door_pics_to_store:
-            cnt += 1
-            cv2.imwrite(os.path.join(path_id, str(cnt) + ".png"), img)
+        print(f"STORING {len(serialized_pics)} door pics cleanly.")
+
+        for cnt, item in enumerate(door_pics_infos_to_store, 1):
+            img_np = np.array(item[0])
+            #img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            img_bgr = img_np
+            cv2.imwrite(os.path.join(path_id, f"{cnt}.png"), img_bgr)
         ## /debug
 
-        # Send request
+        # Send serialized object structure over ZMQ
         self.llm_socket.send_pyobj(data)
 
-        # Wait for response (this BLOCKS until Jetson replies)
         try:
             response = self.llm_socket.recv_pyobj()
             return response
@@ -893,7 +918,7 @@ class SemanticNavigationClient:
         # Small delay to avoid overwhelming the system
         time.sleep(0.05)
 
-    def crop_bbox_from_pil(pil_image, bbox):
+    def crop_bbox_from_pil(self, pil_image, bbox):
         """
         Crops an image segment (usually a door) out of a PIL Image instance.
 
