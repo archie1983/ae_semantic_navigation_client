@@ -369,14 +369,14 @@ class SemanticNavigationClient:
 
         # if we have an open door, then remember that
         #self.detect_open_door_in_image(pil_image)
-        print("AE: objs_in_image and item_infos at place 1: ", objs_in_image, item_infos)
         if "OPENDOOR" in objs_in_image:
             self.open_door_incidence_last10.append(True)
             # if we have detected an OPENDOOR, then we also want to know the tracking IDs for these doors so that we can
             # later block them out if needed. We will be clearing this collection out together with self.fpv_images_last_x.
-            door_track_ids = [item['track_id'] for item in item_infos if item['name'] == 'OPENDOOR']
-            self.open_door_track_ids_last_x.append(door_track_ids)
-            print("AE: Adding door_track_ids in self.open_door_track_ids_last_x: ", door_track_ids)
+            door_track_ids = [{'track_id': item['track_id'], 'relative_distance': self.check_door_proximity(item['bbox'])[1]} for item in item_infos if item['name'] == 'OPENDOOR']
+            track_id_to_add = sorted(door_track_ids, key=lambda x: x['relative_distance'])[0]
+            self.open_door_track_ids_last_x.append([track_id_to_add['track_id']])
+            print("AE: Adding door_track_ids in self.open_door_track_ids_last_x: ", track_id_to_add)
 
             # If we've spotted an OPENDOOR, then let's store a cropped image of it along with its tracker ID so that later
             # when we store a door transition, we have a good distribution of what this door looks like from different
@@ -386,13 +386,31 @@ class SemanticNavigationClient:
             # total running history of door track IDs which we only clear one by one when the buffer is full.
             # self.doors_in_current_transition_run is for the current transition only (there is always a transition BTW,
             # because sooner or later we will go through a door).
+            potential_doors_to_add_to_current_transition = []
+
             for item in item_infos:
                 if item['name'] == 'OPENDOOR':
                     track_id = item['track_id']
                     bbox = item['bbox']
-                    door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
-                    self.add_door_in_current_transition_run(track_id, bbox, door_only_pic)
-                    print("AE: Adding track_id to self.doors_in_current_transition_run : ", track_id)
+                    _, relative_distance = self.check_door_proximity(bbox)
+                    potential_doors_to_add_to_current_transition.append({'track_id': track_id, 'bbox': bbox, 'relative_distance': relative_distance})
+
+            nearest_door = sorted(potential_doors_to_add_to_current_transition, key = lambda x: x['relative_distance'])[0]
+            door_only_pic = self.crop_bbox_from_pil(pil_image, nearest_door['bbox'])
+            self.add_door_in_current_transition_run(nearest_door['track_id'], nearest_door['bbox'], door_only_pic)
+            print("AE: Adding track_id to self.doors_in_current_transition_run : ", nearest_door)
+
+            # for item in item_infos:
+            #     if item['name'] == 'OPENDOOR':
+            #         track_id = item['track_id']
+            #         bbox = item['bbox']
+            #         door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
+            #
+            #         # TODO: Only add the nearest door if there are several.
+            #         _, relative_distance = self.check_door_proximity(bbox)
+            #
+            #         self.add_door_in_current_transition_run(track_id, bbox, door_only_pic)
+            #         print("AE: Adding track_id to self.doors_in_current_transition_run : ", track_id)
         else:
             self.open_door_incidence_last10.append(False)
             self.open_door_track_ids_last_x.append([])
@@ -437,6 +455,7 @@ class SemanticNavigationClient:
                 if most_common_door_track_id is not None:
                     door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
                     # Store door pics to vector DB pertaining to this transition.
+                    # TODO: Why we didn't get DOORPICS when transiting from BEDROOM to LIVING_ROOM?
                     if len(door_pics_infos_to_store) > 0:
                         self.store_door_images_of_transition(door_pics_infos_to_store, self.prev_room_type, self.current_room_type)
                     else:
@@ -456,8 +475,32 @@ class SemanticNavigationClient:
 
         return item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted
 
+    def check_door_proximity(self, bbox, image_height=600, min_percentage=0.25):
+        """
+        Checks if a door is close enough to confidently identify/block,
+        using a normalized vertical scale factor to bypass width variations.
+
+        Args:
+            bbox: List [xmin, ymin, xmax, ymax]
+            image_height: The absolute height of the raw camera frame (e.g., 600)
+            min_percentage: The minimum portion of the screen height the door must occupy
+        """
+        xmin, ymin, xmax, ymax = bbox
+
+        # Calculate vertical height in pixels
+        door_pixel_height = ymax - ymin
+
+        # Calculate what percentage of the camera's field of view the door height occupies
+        occupancy_ratio = door_pixel_height / image_height
+
+        # If occupancy ratio is 0.25, the door takes up 25% of the frame vertically
+        if occupancy_ratio >= min_percentage:
+            return True, occupancy_ratio
+
+        return False, occupancy_ratio
+
     def do_we_need_to_paint_this_door(self, stored_door_info):
-        if stored_door_info['qry_results'] and len(stored_door_info['qry_results'] > 0) and stored_door_info['qry_results']['similarity'] > 0.8:
+        if stored_door_info['qry_results'] and len(stored_door_info['qry_results']) > 0 and stored_door_info['qry_results'][0]['similarity'] > 0.8:
             return True
         else:
             print("AE: Stored Door Info: ", stored_door_info)
@@ -487,8 +530,8 @@ class SemanticNavigationClient:
             #imgs_to_embed = self.fpv_images_last_x[5:]
             imgs_to_embed = self.fpv_images_last_x[-5:]  # get last images -- self.IMGS_TO_EMBED
             qry_result = self.qry_door_transition(np.stack(imgs_to_embed))
-            if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0:
-                print("AE: IMG QUERY: ", qry_result['qry_results'][0], " imgs_cnt: ", len(imgs_to_embed))
+            # if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0:
+            #     print("AE: IMG QUERY: ", qry_result['qry_results'][0], " imgs_cnt: ", len(imgs_to_embed))
 
             if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] >= 0.92:
                 best_match = qry_result['qry_results'][0]
@@ -509,7 +552,6 @@ class SemanticNavigationClient:
                 # result = (bbox_to_cover, best_match['early_or_late'])
 
         ## This is the new way (note the nesting level):
-        print("AE: objs_in_image and item_infos at place 2: ", objs_in_image, item_infos)
         if 'OPENDOOR' in objs_in_image:
             for item in item_infos:
                 if item['name'] == 'OPENDOOR':
