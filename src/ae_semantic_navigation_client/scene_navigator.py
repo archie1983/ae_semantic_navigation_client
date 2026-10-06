@@ -130,7 +130,7 @@ class SceneNavigator:
             if next_move_str == "STOP":
                 continue
             else:
-                self.rnc.execute_action(next_move_str, moveMagnitude=self.grid_size, grid_size=self.grid_size,
+                self.rnc.execute_action(next_move_str, degrees=45, moveMagnitude=self.grid_size, grid_size=self.grid_size,
                                         adhere_to_grid=True)
 
         # If we had to interrupt, then reset the interupt and clean up action generator

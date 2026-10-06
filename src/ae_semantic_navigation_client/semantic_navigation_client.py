@@ -119,6 +119,7 @@ class ActionGenerator:
                 interpolation=cv2.INTER_LANCZOS4  # High quality
             )
 
+            # if we have a bbox to cover and we've already ran for at least 10 steps, then reset
             if self.steps_after_reset >= 10:
                 self.reset()
 
@@ -375,8 +376,11 @@ class SemanticNavigationClient:
             # later block them out if needed. We will be clearing this collection out together with self.fpv_images_last_x.
             door_track_ids = [{'track_id': item['track_id'], 'relative_distance': self.check_door_proximity(item['bbox'])[1]} for item in item_infos if item['name'] == 'OPENDOOR']
             track_id_to_add = sorted(door_track_ids, key=lambda x: x['relative_distance'])[0]
-            self.open_door_track_ids_last_x.append([track_id_to_add['track_id']])
-            print("AE: Adding door_track_ids in self.open_door_track_ids_last_x: ", track_id_to_add)
+            if track_id_to_add['track_id'] > -1: # only add it if we've got a history of tracking it
+                self.open_door_track_ids_last_x.append([track_id_to_add['track_id']])
+                #print("AE: Adding door_track_ids in self.open_door_track_ids_last_x: ", track_id_to_add)
+            else:
+                self.open_door_track_ids_last_x.append([]) # append empty list to keep consistend with self.fpv_images_last_x
 
             # If we've spotted an OPENDOOR, then let's store a cropped image of it along with its tracker ID so that later
             # when we store a door transition, we have a good distribution of what this door looks like from different
@@ -397,8 +401,9 @@ class SemanticNavigationClient:
 
             nearest_door = sorted(potential_doors_to_add_to_current_transition, key = lambda x: x['relative_distance'])[0]
             door_only_pic = self.crop_bbox_from_pil(pil_image, nearest_door['bbox'])
-            self.add_door_in_current_transition_run(nearest_door['track_id'], nearest_door['bbox'], door_only_pic)
-            print("AE: Adding track_id to self.doors_in_current_transition_run : ", nearest_door)
+            if nearest_door['track_id'] > -1: # only add it if we've got a history of tracking it
+                self.add_door_in_current_transition_run(nearest_door['track_id'], nearest_door['bbox'], door_only_pic)
+                #print("AE: Adding track_id to self.doors_in_current_transition_run : ", nearest_door)
 
             # for item in item_infos:
             #     if item['name'] == 'OPENDOOR':
@@ -414,7 +419,7 @@ class SemanticNavigationClient:
         else:
             self.open_door_incidence_last10.append(False)
             self.open_door_track_ids_last_x.append([])
-            print("AE: Adding door_track_ids: NONE")
+            #print("AE: Adding door_track_ids: NONE")
 
         if len(self.open_door_incidence_last10) > 10:
             #self.open_door_incidence_last10 = self.open_door_incidence_last10[1:]
@@ -433,7 +438,10 @@ class SemanticNavigationClient:
             # If it is not defined, then assume that we're discovering the room type for the first time and the
             # collected objects need not be erased, but collected for the new room type, which will happen outside this
             # if block.
-            if not(self.is_room_nonsense(self.prev_room_type)) and not (self.is_room_nonsense(self.current_room_type)):
+            if not(self.is_room_nonsense(self.prev_room_type)) and not(self.is_room_nonsense(self.current_room_type)):
+                if self.current_room_type.name == "NOT_KNOWN":
+                    print("AE: NONSESNSE OF ROOMS: ", self.prev_room_type, self.current_room_type, (not(self.is_room_nonsense(self.prev_room_type)) and not(self.is_room_nonsense(self.current_room_type))))
+                    exit()
             # this might be a case of walking through an open plan living room into a kitchen (in which case we won't
             # have a door, or this might be a transition through a door. If it's through a door, then we want to save it
             #
@@ -500,16 +508,19 @@ class SemanticNavigationClient:
         return False, occupancy_ratio
 
     def do_we_need_to_paint_this_door(self, stored_door_info):
-        if stored_door_info['qry_results'] and len(stored_door_info['qry_results']) > 0 and stored_door_info['qry_results'][0]['similarity'] > 0.8:
+        if ((stored_door_info['qry_results'] and
+                len(stored_door_info['qry_results']) > 0 and
+                stored_door_info['qry_results'][0]['similarity'] > 0.8)
+            and (stored_door_info['qry_results'][0] == self.current_room_type)):
             return True
         else:
-            print("AE: Stored Door Info: ", stored_door_info)
+            #print("AE: Stored Door Info: ", stored_door_info)
             return False
 
-    def is_room_nonsense(self, current_room_type):
-        if (self.prev_room_type == None
-            or self.prev_room_type == RoomType.NOT_KNOWN
-            or self.prev_room_type == RoomType.NOT_CLASSIFIED):
+    def is_room_nonsense(self, room_type):
+        if (room_type == None
+            or room_type == RoomType.NOT_KNOWN
+            or room_type == RoomType.NOT_CLASSIFIED):
             return True
         else:
             return False
@@ -567,7 +578,8 @@ class SemanticNavigationClient:
                         result = (bbox_to_cover, True)
 
         if room_transition_spotted:
-            print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
+            #print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
+            print("TRANS DR: ", self.prev_room_type, self.current_room_type)
 
         return result
 
@@ -610,6 +622,11 @@ class SemanticNavigationClient:
             #self.remedy_commands.append(self.go_to_room_centre)
             self.remedy_commands.append(self.do_random_rotation)
             self.remedy_commands.append(self.go_to_next_room)
+            self.dr_action_gen.reset()
+        elif self.current_active_SNP == SNPType.ROOM_CENTRE_FINDER:
+            self.rc_action_gen.reset()
+        elif self.current_active_SNP == SNPType.PERIMETER_WALKER:
+            self.per_action_gen.reset()
 
     def process_incoming_image_rc(self, pil_image):
         '''
@@ -621,7 +638,8 @@ class SemanticNavigationClient:
         item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted = self.process_incoming_image(pil_image)
 
         if room_transition_spotted:
-            print("TRANS RC: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
+            #print("TRANS RC: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
+            print("TRANS RC: ", self.prev_room_type, self.current_room_type)
 
         # Not sure what else we might want to do in the room centre finder - at least for now while I'm focussing on environment exploration.
 
@@ -635,9 +653,14 @@ class SemanticNavigationClient:
         item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted = self.process_incoming_image(pil_image)
 
         if room_transition_spotted:
-            print("TRANS PER: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
+            #print("TRANS PER: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
+            print("TRANS PER: ", self.prev_room_type, self.current_room_type)
 
         # Not sure what else we might want to do in the perimeter finder - at least for now while I'm focussing on environment exploration.
+
+        # Run perimeter finder for 100 steps only to promote room exploration before we resort to RC SNP
+        if self.per_action_gen.steps_after_reset >= 50:
+            self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
 
     def update_room_detections_after_instability(self, instability_info):
         if instability_info is None or len(instability_info) <= 0: return
@@ -700,8 +723,10 @@ class SemanticNavigationClient:
         self.rc_action_gen.set_image_receiver(self.process_incoming_image_rc)
         self.scene_navigator.set_action_gen(self.rc_action_gen)
         self.current_active_SNP = SNPType.ROOM_CENTRE_FINDER
+        print("AE: ROOM_CENTRE_FINDER started")
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
+        print("AE: ROOM_CENTRE_FINDER ended")
 
     def go_to_next_room(self):
         """
@@ -711,8 +736,11 @@ class SemanticNavigationClient:
         self.dr_action_gen.set_image_receiver(self.process_incoming_image_dr)
         self.scene_navigator.set_action_gen(self.dr_action_gen)
         self.current_active_SNP = SNPType.DOOR_FINDER
+        print("AE: DOOR_FINDER started")
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
+        # trigger here a transition to a new room - store door images that we may have just seen
+        print("AE: DOOR_FINDER ended")
 
     def go_to_perimeter_of_room(self):
         """
@@ -722,8 +750,10 @@ class SemanticNavigationClient:
         self.per_action_gen.set_image_receiver(self.process_incoming_image_per)
         self.scene_navigator.set_action_gen(self.per_action_gen)
         self.current_active_SNP = SNPType.PERIMETER_WALKER
+        print("AE: PERIMETER_WALKER started")
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
+        print("AE: PERIMETER_WALKER ended")
 
     def do_random_rotation(self):
         """
@@ -784,7 +814,7 @@ class SemanticNavigationClient:
         ## debug - Keeping your exact diagnostic loop working smoothly
         path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored) + "_DOORPICS"
         os.makedirs(path_id, exist_ok=True)
-        print(f"STORING {len(serialized_pics)} door pics cleanly. shapes: ", [item['shape'] for item in data['door_pics']])
+        print(f"STORING {len(serialized_pics)} door pics. shapes: ", [item['shape'] for item in data['door_pics']])
 
         for cnt, item in enumerate(door_pics_infos_to_store, 1):
             img_np = np.array(item[0])
@@ -858,7 +888,7 @@ class SemanticNavigationClient:
         path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored) + "_" + ('EARLY' if early_or_late else 'IMM')
         os.makedirs(path_id, exist_ok=True)
         cnt = 0
-        print("STORING ", len(path_imgs), " images. early_or_late = ", early_or_late)
+        #print("STORING ", len(path_imgs), " images. early_or_late = ", early_or_late)
         for img in path_imgs:
             cnt += 1
             cv2.imwrite(os.path.join(path_id, str(cnt) + ".png"), img)
@@ -1176,9 +1206,11 @@ if __name__ == "__main__":
 
     agent.reset_seen_objs()
     rooms_to_traverse = 7
+    #agent.add_main_command(agent.go_to_room_centre)
     for i in range(rooms_to_traverse):
         agent.add_main_command(agent.go_to_room_centre)
         agent.add_main_command(agent.go_to_next_room)
+        agent.add_main_command(agent.go_to_perimeter_of_room)
 
     agent.do_work()
 
