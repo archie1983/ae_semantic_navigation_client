@@ -228,6 +228,7 @@ class SemanticNavigationClient:
     IMGS_TO_EMBED = 10
     IMG_HISTORY_FOR_IMM_VPR = 40 # how long in the past to look if we want to store immediate door transition (we're close to the door).
     IMG_HISTORY_FOR_EARLY_VPR = 60 # ditto, but for early VPR (when we're only approaching)
+    DEBUG = True
 
     def __init__(self, jetson_ip, habitat_id = 78):
         self.context = zmq.Context()
@@ -434,45 +435,7 @@ class SemanticNavigationClient:
 
         # If room transition spotted, then we want to manage objects seen in the previous room
         if room_transition_spotted:
-            # If previous room is defined, then reset objects seen in that room because we will store new objects
-            # If it is not defined, then assume that we're discovering the room type for the first time and the
-            # collected objects need not be erased, but collected for the new room type, which will happen outside this
-            # if block.
-            if not(self.is_room_nonsense(self.prev_room_type)) and not(self.is_room_nonsense(self.current_room_type)):
-                if self.current_room_type.name == "NOT_KNOWN":
-                    print("AE: NONSESNSE OF ROOMS: ", self.prev_room_type, self.current_room_type, (not(self.is_room_nonsense(self.prev_room_type)) and not(self.is_room_nonsense(self.current_room_type))))
-                    exit()
-            # this might be a case of walking through an open plan living room into a kitchen (in which case we won't
-            # have a door, or this might be a transition through a door. If it's through a door, then we want to save it
-            #
-            # For now let's detect all transitions regardless of doors.
-            #if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:
-                #imgs_to_embed = self.fpv_images_last_x[:self.IMGS_TO_EMBED]  # Or save the mid-point transition images
-                imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_IMM_VPR:][:self.IMGS_TO_EMBED] # take first 10 images from the history of 40 back
-                self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, False)
-
-                # now let's see if we have enough imagery for an early transition storage
-                if len(self.fpv_images_last_x) >= self.IMG_HISTORY_FOR_EARLY_VPR:
-                    imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_EARLY_VPR:][:self.IMGS_TO_EMBED]  # take first 10 images from the history of 40 back
-                    self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, True)
-
-                # Now that we've stored transition to a new room, let's also store the looks of the door that brought us there
-                # The most commond door track ID in the recent history (something like last 10 images) should be the door that's
-                # lead us to the new room.
-                most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
-                if most_common_door_track_id is not None:
-                    door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
-                    # Store door pics to vector DB pertaining to this transition.
-                    # TODO: Why we didn't get DOORPICS when transiting from BEDROOM to LIVING_ROOM?
-                    if len(door_pics_infos_to_store) > 0:
-                        self.store_door_images_of_transition(door_pics_infos_to_store, self.prev_room_type, self.current_room_type)
-                    else:
-                        # TODO: Remove this branch once we have confirmed that this condition is fixed and does not happen anymore
-                        print("AE: self.doors_in_current_transition_run : ", [item['track_id'] for item in self.doors_in_current_transition_run], " most_common_door_track_id: ", most_common_door_track_id, " self.open_door_track_ids_last_x[-10:]: ", self.open_door_track_ids_last_x[-10:])
-                        exit()
-
-                self.reset_seen_objs()
-                self.reset_doors_in_current_transition_run()
+            self.process_room_transition(skip_storing_data=self.DEBUG)
 
         # collect seen objects for this room type (or room)
         self.objs_in_current_room = self.objs_in_current_room.union(objs_in_image)
@@ -536,7 +499,7 @@ class SemanticNavigationClient:
 
         result = (None, None)
 
-        if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:#self.IMGS_TO_EMBED:
+        if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5 and not self.DEBUG:#self.IMGS_TO_EMBED:
         #if room_transition_spotted:
             #imgs_to_embed = self.fpv_images_last_x[5:]
             imgs_to_embed = self.fpv_images_last_x[-5:]  # get last images -- self.IMGS_TO_EMBED
@@ -563,7 +526,7 @@ class SemanticNavigationClient:
                 # result = (bbox_to_cover, best_match['early_or_late'])
 
         ## This is the new way (note the nesting level):
-        if 'OPENDOOR' in objs_in_image:
+        if 'OPENDOOR' in objs_in_image and not self.DEBUG:
             for item in item_infos:
                 if item['name'] == 'OPENDOOR':
                     bbox = item['bbox']
@@ -715,6 +678,78 @@ class SemanticNavigationClient:
 
         return {'room_type': room_type, 'item_infos': item_infos}
 
+    def process_room_transition_debug(self):
+        most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
+
+        door_track_ids = [
+            (item['track_id'], float(np.round(self.check_door_proximity(item['bbox'])[1], 2))) for item in
+            self.doors_in_current_transition_run]
+
+        print("AE: self.doors_in_current_transition_run : ",
+              door_track_ids, " most_common_door_track_id: ",
+              most_common_door_track_id, " self.open_door_track_ids_last_x[-10:]: ",
+              self.open_door_track_ids_last_x[-10:])
+
+        path_id = "debug_door_pics"
+        os.makedirs(path_id, exist_ok=True)
+        for item in self.doors_in_current_transition_run:
+            img_np = np.array(item['door_pic'])
+            prox = float(np.round(self.check_door_proximity(item['bbox'])[1], 2))
+            prox = str(prox).replace('.', '_')
+            cv2.imwrite(os.path.join(path_id, f"{item['track_id']}_{prox}.png"), img_np)
+
+    def process_room_transition(self, skip_storing_data = False):
+        """
+        When room has changed (e.g. Door SNP has completed work or we have classified  a new room type),
+        this function will do what needs doing- storing doors' images in various ways, etc.
+
+        :param skip_storing_data: For debug purposes: skip storing images in Vector DB
+
+        :return:
+        """
+        if skip_storing_data:
+            if not(self.is_room_nonsense(self.prev_room_type)) and not(self.is_room_nonsense(self.current_room_type)):
+                self.reset_seen_objs()
+                self.reset_doors_in_current_transition_run()
+        else:
+            # We want to manage objects seen in the previous room
+            # If previous room is defined, then reset objects seen in that room because we will store new objects
+            # If it is not defined, then assume that we're discovering the room type for the first time and the
+            # collected objects need not be erased, but collected for the new room type, which will happen outside this
+            # if block.
+            if not(self.is_room_nonsense(self.prev_room_type)) and not(self.is_room_nonsense(self.current_room_type)):
+            # this might be a case of walking through an open plan living room into a kitchen (in which case we won't
+            # have a door, or this might be a transition through a door. If it's through a door, then we want to save it
+            #
+            # For now let's detect all transitions regardless of doors.
+            #if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:
+                #imgs_to_embed = self.fpv_images_last_x[:self.IMGS_TO_EMBED]  # Or save the mid-point transition images
+                imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_IMM_VPR:][:self.IMGS_TO_EMBED] # take first 10 images from the history of 40 back
+                self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, False)
+
+                # now let's see if we have enough imagery for an early transition storage
+                if len(self.fpv_images_last_x) >= self.IMG_HISTORY_FOR_EARLY_VPR:
+                    imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_EARLY_VPR:][:self.IMGS_TO_EMBED]  # take first 10 images from the history of 40 back
+                    self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, True)
+
+                # Now that we've stored transition to a new room, let's also store the looks of the door that brought us there
+                # The most commond door track ID in the recent history (something like last 10 images) should be the door that's
+                # lead us to the new room.
+                most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
+                if most_common_door_track_id is not None:
+                    door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
+                    # Store door pics to vector DB pertaining to this transition.
+                    # TODO: Why we didn't get DOORPICS when transiting from BEDROOM to LIVING_ROOM?
+                    if len(door_pics_infos_to_store) > 0:
+                        self.store_door_images_of_transition(door_pics_infos_to_store, self.prev_room_type, self.current_room_type)
+                    else:
+                        # TODO: Remove this branch once we have confirmed that this condition is fixed and does not happen anymore
+                        print("AE: self.doors_in_current_transition_run : ", [item['track_id'] for item in self.doors_in_current_transition_run], " most_common_door_track_id: ", most_common_door_track_id, " self.open_door_track_ids_last_x[-10:]: ", self.open_door_track_ids_last_x[-10:])
+                        exit()
+
+                self.reset_seen_objs()
+                self.reset_doors_in_current_transition_run()
+
     def go_to_room_centre(self):
         """
         Use remote DreamerV3 model on Jetson to put the agent at the centre of the current room
@@ -740,6 +775,7 @@ class SemanticNavigationClient:
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
         # trigger here a transition to a new room - store door images that we may have just seen
+        self.process_room_transition_debug()
         print("AE: DOOR_FINDER ended")
 
     def go_to_perimeter_of_room(self):
