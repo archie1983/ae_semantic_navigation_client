@@ -7,7 +7,7 @@ from ai2_thor_model_training import index_to_action
 from ae_llm_navigation_decisions import RoomType
 from collections import Counter
 from enum import Enum
-from collections import deque
+from collections import deque, defaultdict
 
 class ActionGenerator:
     def __init__(self, dreamer_socket):
@@ -270,6 +270,7 @@ class SemanticNavigationClient:
         self.reset_last_pics()
         self.reset_last_room_type_identifations()
         self.reset_doors_in_current_transition_run()
+        self.reset_door_transition_pics()
 
         self.common_objs = {'OPENDOOR', 'CLOSEDDOOR', 'FLOOR'}
         self.current_room_type = RoomType.NOT_KNOWN
@@ -293,10 +294,14 @@ class SemanticNavigationClient:
         self.fpv_images_last_x = []
         self.open_door_track_ids_last_x = []
 
+    def reset_door_transition_pics(self):
+        self.door_pics = []
+        self.whole_transition_pics = []
+
     def reset_doors_in_current_transition_run(self):
         self.doors_in_current_transition_run = []
 
-    def add_door_in_current_transition_run(self, track_id, bbox, door_pic):
+    def add_door_in_current_transition_run(self, track_id, bbox, door_pic, whole_pic = None):
         """
         When we transit to a different room, we want to have a good set of doors that lead us there. This collection
         will allow tracking them.
@@ -305,7 +310,7 @@ class SemanticNavigationClient:
         :param door_pic: cropped door
         :return:
         """
-        self.doors_in_current_transition_run.append({'track_id': track_id, 'bbox': bbox, 'door_pic': door_pic})
+        self.doors_in_current_transition_run.append({'track_id': track_id, 'bbox': bbox, 'door_pic': door_pic, 'whole_pic': whole_pic})
 
     def reset_last_room_type_identifations(self):
         self.room_type_id_last10 = []
@@ -391,32 +396,36 @@ class SemanticNavigationClient:
             # total running history of door track IDs which we only clear one by one when the buffer is full.
             # self.doors_in_current_transition_run is for the current transition only (there is always a transition BTW,
             # because sooner or later we will go through a door).
-            potential_doors_to_add_to_current_transition = []
 
-            for item in item_infos:
-                if item['name'] == 'OPENDOOR':
-                    track_id = item['track_id']
-                    bbox = item['bbox']
-                    _, relative_distance = self.check_door_proximity(bbox)
-                    potential_doors_to_add_to_current_transition.append({'track_id': track_id, 'bbox': bbox, 'relative_distance': relative_distance})
-
-            nearest_door = sorted(potential_doors_to_add_to_current_transition, key = lambda x: x['relative_distance'])[0]
-            door_only_pic = self.crop_bbox_from_pil(pil_image, nearest_door['bbox'])
-            if nearest_door['track_id'] > -1: # only add it if we've got a history of tracking it
-                self.add_door_in_current_transition_run(nearest_door['track_id'], nearest_door['bbox'], door_only_pic)
-                #print("AE: Adding track_id to self.doors_in_current_transition_run : ", nearest_door)
-
+            # TODO: Decide which one to use:
+            # this one is only the nearest door stored
+            # potential_doors_to_add_to_current_transition = []
             # for item in item_infos:
             #     if item['name'] == 'OPENDOOR':
             #         track_id = item['track_id']
             #         bbox = item['bbox']
-            #         door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
-            #
-            #         # TODO: Only add the nearest door if there are several.
             #         _, relative_distance = self.check_door_proximity(bbox)
+            #         potential_doors_to_add_to_current_transition.append({'track_id': track_id, 'bbox': bbox, 'relative_distance': relative_distance})
             #
-            #         self.add_door_in_current_transition_run(track_id, bbox, door_only_pic)
-            #         print("AE: Adding track_id to self.doors_in_current_transition_run : ", track_id)
+            # nearest_door = sorted(potential_doors_to_add_to_current_transition, key = lambda x: x['relative_distance'])[0]
+            # door_only_pic = self.crop_bbox_from_pil(pil_image, nearest_door['bbox'])
+            # if nearest_door['track_id'] > -1: # only add it if we've got a history of tracking it
+            #     self.add_door_in_current_transition_run(nearest_door['track_id'], nearest_door['bbox'], door_only_pic)
+            #     #print("AE: Adding track_id to self.doors_in_current_transition_run : ", nearest_door)
+
+            # TODO: see above
+            # this one is all doors in frame
+            for item in item_infos:
+                if item['name'] == 'OPENDOOR':
+                    track_id = item['track_id']
+                    bbox = item['bbox']
+                    door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
+
+                    # TODO: Only add the nearest door if there are several.
+                    _, relative_distance = self.check_door_proximity(bbox)
+                    if track_id > -1:
+                        self.add_door_in_current_transition_run(track_id, bbox, door_only_pic, pil_image)
+                    #print("AE: Adding track_id to self.doors_in_current_transition_run : ", track_id)
         else:
             self.open_door_incidence_last10.append(False)
             self.open_door_track_ids_last_x.append([])
@@ -539,6 +548,7 @@ class SemanticNavigationClient:
                     if (self.do_we_need_to_paint_this_door(stored_door_info)):
                         bbox_to_cover = item['bbox']
                         result = (bbox_to_cover, True)
+                        # TODO: clear out the collected door images if we're going to reset the door SNP
 
         if room_transition_spotted:
             #print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
@@ -681,12 +691,18 @@ class SemanticNavigationClient:
     def process_room_transition_debug(self):
         most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
 
-        door_track_ids = [
-            (item['track_id'], float(np.round(self.check_door_proximity(item['bbox'])[1], 2))) for item in
-            self.doors_in_current_transition_run]
+        doors_infos = [
+            (item['track_id'],
+             float(np.round(self.check_door_proximity(item['bbox'])[1], 2)),
+             item['door_pic'],
+             item['whole_pic']
+             ) for item in self.doors_in_current_transition_run]
+
+        # group the self.doors_in_current_transition_run items by track_id
+        _, target_tracks, self.door_pics, self.whole_transition_pics = self.analyze_door_trajectories(doors_infos)
 
         print("AE: self.doors_in_current_transition_run : ",
-              door_track_ids, " most_common_door_track_id: ",
+              doors_infos, " most_common_door_track_id: ",
               most_common_door_track_id, " self.open_door_track_ids_last_x[-10:]: ",
               self.open_door_track_ids_last_x[-10:])
 
@@ -694,9 +710,83 @@ class SemanticNavigationClient:
         os.makedirs(path_id, exist_ok=True)
         for item in self.doors_in_current_transition_run:
             img_np = np.array(item['door_pic'])
+            img_np_whole = np.array(item['whole_pic'])
             prox = float(np.round(self.check_door_proximity(item['bbox'])[1], 2))
             prox = str(prox).replace('.', '_')
             cv2.imwrite(os.path.join(path_id, f"{item['track_id']}_{prox}.png"), img_np)
+            cv2.imwrite(os.path.join(path_id, f"{item['track_id']}_{prox}_w.png"), img_np_whole)
+
+        path_id = "debug_chosen_door_pics"
+        cnt = 0
+        os.makedirs(path_id, exist_ok=True)
+        for door_pic in chosen_door_pics:
+            cnt += 1
+            img_np = np.array(door_pic)
+            cv2.imwrite(os.path.join(path_id, f"{target_tracks[-1][0]}_{cnt}.png"), img_np)
+
+        cnt = 0
+        os.makedirs(path_id, exist_ok=True)
+        for door_pic in chosen_whole_pics:
+            cnt += 1
+            img_np = np.array(door_pic)
+            cv2.imwrite(os.path.join(path_id, f"{target_tracks[-1][0]}_w_{cnt}.png"), img_np)
+
+    def analyze_door_trajectories(self, doors_info):
+        """
+        Analyses door tracking sequences to separate true approaches from brief glances.
+
+        Args:
+            raw_tuples: List of (track_id, occupancy_ratio, ...) tuples
+        Returns:
+            analysis_report: Dict mapping track_id to its telemetry metrics
+            target_tracks: List of track_ids that qualify as a definitive approach/breach
+        """
+        # 1. Group the raw sequence into list of ratios per track_id
+        grouped_data = defaultdict(list)
+        for track_id, ratio, door_pic, whole_pic in doors_info:
+            detection_info = (ratio, door_pic, whole_pic)
+            grouped_data[track_id].append(detection_info)
+
+        analysis_report = {}
+        target_tracks = []
+
+        # 2. Extract spatial-temporal statistics per unique door track
+        for track_id, detection_infos in grouped_data.items():
+            frame_count = len(detection_infos)
+            ratios = [item[0] for item in detection_infos]
+            door_pics = [item[1] for item in detection_infos]
+            whole_pics = [item[2] for item in detection_infos]
+            max_ratio = max(ratios)
+            min_ratio = min(ratios)
+
+            # Trend indicates if it's generally growing (robot approaching)
+            # calculated via simple delta between last and first appearance
+            ratio_trend = ratios[-1] - ratios[0]
+
+            analysis_report[track_id] = {
+                'frame_count': frame_count,
+                'max_occupancy': round(max_ratio, 4),
+                'min_occupancy': round(min_ratio, 4),
+                'trend': round(ratio_trend, 4),
+                'raw_sequence': ratios,
+                'door_pics': door_pics,
+                'whole_pics': whole_pics
+            }
+
+            # 3. Dynamic Threshold Constraints (Robotics Filtering Heuristic)
+            # - Frame count > 5: Eliminates tracking flicker or accidental quick sweeps
+            # - Max occupancy >= 0.85: Confirms the robot got physically close to it
+            if frame_count > 5 and max_ratio >= 0.85:
+                target_tracks.append((track_id, frame_count))
+
+        target_tracks = sorted(target_tracks, key=lambda x: x[1])
+        #print(target_tracks)
+        chosen_track_id = target_tracks[-1][0]
+        #print("chosen_track_id: ", chosen_track_id)
+        chosen_door_pics = analysis_report[chosen_track_id]['door_pics']
+        chosen_whole_pics = analysis_report[chosen_track_id]['whole_pics']
+
+        return analysis_report, target_tracks, chosen_door_pics, chosen_whole_pics
 
     def process_room_transition(self, skip_storing_data = False):
         """
@@ -724,24 +814,29 @@ class SemanticNavigationClient:
             # For now let's detect all transitions regardless of doors.
             #if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:
                 #imgs_to_embed = self.fpv_images_last_x[:self.IMGS_TO_EMBED]  # Or save the mid-point transition images
-                imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_IMM_VPR:][:self.IMGS_TO_EMBED] # take first 10 images from the history of 40 back
-                self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, False)
+                # TODO: use the selected door and FPV images during door SNP
+                #imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_IMM_VPR:][:self.IMGS_TO_EMBED] # take first 10 images from the history of 40 back
+                #self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, False)
+                self.store_door_transition(np.stack(self.whole_transition_pics), self.prev_room_type, self.current_room_type, False)
 
                 # now let's see if we have enough imagery for an early transition storage
-                if len(self.fpv_images_last_x) >= self.IMG_HISTORY_FOR_EARLY_VPR:
-                    imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_EARLY_VPR:][:self.IMGS_TO_EMBED]  # take first 10 images from the history of 40 back
-                    self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, True)
+                # if len(self.fpv_images_last_x) >= self.IMG_HISTORY_FOR_EARLY_VPR:
+                #     imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_EARLY_VPR:][:self.IMGS_TO_EMBED]  # take first 10 images from the history of 40 back
+                #     self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, True)
+                # if len(self.door_pics) >= 0:
+                #     self.store_door_transition(np.stack(self.door_pics), self.prev_room_type, self.current_room_type, True)
 
                 # Now that we've stored transition to a new room, let's also store the looks of the door that brought us there
                 # The most commond door track ID in the recent history (something like last 10 images) should be the door that's
                 # lead us to the new room.
                 most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
                 if most_common_door_track_id is not None:
-                    door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
+                    #door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
                     # Store door pics to vector DB pertaining to this transition.
                     # TODO: Why we didn't get DOORPICS when transiting from BEDROOM to LIVING_ROOM?
-                    if len(door_pics_infos_to_store) > 0:
-                        self.store_door_images_of_transition(door_pics_infos_to_store, self.prev_room_type, self.current_room_type)
+                    #if len(door_pics_infos_to_store) > 0:
+                    if len(self.door_pics) > 0:
+                        self.store_door_images_of_transition(self.door_pics, self.prev_room_type, self.current_room_type)
                     else:
                         # TODO: Remove this branch once we have confirmed that this condition is fixed and does not happen anymore
                         print("AE: self.doors_in_current_transition_run : ", [item['track_id'] for item in self.doors_in_current_transition_run], " most_common_door_track_id: ", most_common_door_track_id, " self.open_door_track_ids_last_x[-10:]: ", self.open_door_track_ids_last_x[-10:])
