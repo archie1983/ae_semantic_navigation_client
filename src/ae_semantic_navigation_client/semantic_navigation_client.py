@@ -503,10 +503,11 @@ class SemanticNavigationClient:
         if ((stored_door_info['qry_results'] and
                 len(stored_door_info['qry_results']) > 0 and
                 stored_door_info['qry_results'][0]['similarity'] > 0.8)
-            and (stored_door_info['qry_results'][0] == self.current_room_type)):
+            and (stored_door_info['qry_results'][0]['room_from'] == self.current_room_type.name)):
             return True
         else:
-            #print("AE: Stored Door Info: ", stored_door_info)
+            if stored_door_info['qry_results'] and len(stored_door_info['qry_results']) > 0:
+                print("AE: Stored Door Info: ", stored_door_info['qry_results'][0]['similarity'], ' ', stored_door_info['qry_results'][0]['room_from'], ' -> ', stored_door_info['qry_results'][0]['room_to'], ' # cur: ', self.current_room_type.name)
             return False
 
     def is_room_nonsense(self, room_type):
@@ -886,14 +887,15 @@ class SemanticNavigationClient:
                 # Now that we've stored transition to a new room, let's also store the looks of the door that brought us there
                 # The most commond door track ID in the recent history (something like last 10 images) should be the door that's
                 # lead us to the new room.
-                most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
+                #most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
+                most_common_door_track_id = 1 # not relying on it anymore
                 if most_common_door_track_id is not None:
                     #door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
                     # Store door pics to vector DB pertaining to this transition.
                     # TODO: Why we didn't get DOORPICS when transiting from BEDROOM to LIVING_ROOM?
                     #if len(door_pics_infos_to_store) > 0:
                     if len(self.door_pics) > 0:
-                        self.store_door_images_of_transition(zip(self.door_pics, self.bboxes), self.prev_room_type, self.current_room_type)
+                        self.store_door_images_of_transition(list(zip(self.door_pics, self.bboxes)), self.prev_room_type, self.current_room_type)
                     else:
                         # TODO: Remove this branch once we have confirmed that this condition is fixed and does not happen anymore
                         print("AE: self.doors_in_current_transition_run : ", [item['track_id'] for item in self.doors_in_current_transition_run.values()], " most_common_door_track_id: ", most_common_door_track_id, " self.open_door_track_ids_last_x[-10:]: ", self.open_door_track_ids_last_x[-10:])
@@ -967,7 +969,7 @@ class SemanticNavigationClient:
         serialized_pics = []
         door_bboxes_to_store = []
 
-        print("AE: door_pics_infos_to_store: ", door_pics_infos_to_store)
+        #print("AE: door_pics_infos_to_store: ", door_pics_infos_to_store)
 
         for item in door_pics_infos_to_store:
             pil_img = item[0]
@@ -1009,6 +1011,7 @@ class SemanticNavigationClient:
             #img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
             img_bgr = img_np
             cv2.imwrite(os.path.join(path_id, f"{cnt}.png"), img_bgr)
+            print("AE: storing ", cnt, ' ', path_id)
         ## /debug
 
         # Send serialized object structure over ZMQ
