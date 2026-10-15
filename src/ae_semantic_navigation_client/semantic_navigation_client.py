@@ -81,16 +81,16 @@ class ActionGenerator:
         if self.image_receiver is not None:
             vpr_info = self.image_receiver(pil_image_large)
             if vpr_info is not None:
-                bbox_to_cover, early_or_late = vpr_info
+                bbox_to_cover, full_cover = vpr_info
             else:
                 bbox_to_cover = None
-                early_or_late = None
+                full_cover = None
             self.last_image_large = pil_image_large
-        # TODO: implement analysis of early_or_late
+
         # If we got back bbox_to_cover then we need to ablate that in the image before passing back to the SNP
         if bbox_to_cover is not None:
-            # if this is an early detection, then just paint over the doors
-            if early_or_late:
+            # if full cover of image is not required, then just paint over the doors
+            if not full_cover:
                 print("AE: painting DOOR only bbox_to_cover: ", bbox_to_cover, " shape: ", processed_image.shape)
                 # bbox expected format: [xmin, ymin, xmax, ymax]
                 xmin, ymin, xmax, ymax = map(int, bbox_to_cover)
@@ -292,7 +292,6 @@ class SemanticNavigationClient:
 
     def reset_last_pics(self):
         self.fpv_images_last_x = []
-        self.open_door_track_ids_last_x = []
 
     def reset_door_transition_pics(self):
         self.door_pics = []
@@ -398,57 +397,21 @@ class SemanticNavigationClient:
         #self.detect_open_door_in_image(pil_image)
         if "OPENDOOR" in objs_in_image:
             self.open_door_incidence_last10.append(True)
-            # if we have detected an OPENDOOR, then we also want to know the tracking IDs for these doors so that we can
-            # later block them out if needed. We will be clearing this collection out together with self.fpv_images_last_x.
-            door_track_ids = [{'track_id': item['track_id'], 'relative_distance': self.check_door_proximity(item['bbox'])[1]} for item in item_infos if item['name'] == 'OPENDOOR']
-            track_id_to_add = sorted(door_track_ids, key=lambda x: x['relative_distance'])[0]
 
-            if track_id_to_add['track_id'] > -1: # only add it if we've got a history of tracking it
-                self.open_door_track_ids_last_x.append([track_id_to_add['track_id']])
-                #print("AE: Adding door_track_ids in self.open_door_track_ids_last_x: ", track_id_to_add)
-            else:
-                self.open_door_track_ids_last_x.append([]) # append empty list to keep consistend with self.fpv_images_last_x
-
-            # If we've spotted an OPENDOOR, then let's store a cropped image of it along with its tracker ID so that later
-            # when we store a door transition, we have a good distribution of what this door looks like from different
-            # angles and distances.
-            # Important: This is different from self.open_door_track_ids_last_x collection in such a way that we will clear
-            # self.doors_in_current_transition_run when transition completes, but self.open_door_track_ids_last_x is a
-            # total running history of door track IDs which we only clear one by one when the buffer is full.
-            # self.doors_in_current_transition_run is for the current transition only (there is always a transition BTW,
-            # because sooner or later we will go through a door).
-
-            # TODO: Decide which one to use:
-            # this one is only the nearest door stored
-            # potential_doors_to_add_to_current_transition = []
-            # for item in item_infos:
-            #     if item['name'] == 'OPENDOOR':
-            #         track_id = item['track_id']
-            #         bbox = item['bbox']
-            #         _, relative_distance = self.check_door_proximity(bbox)
-            #         potential_doors_to_add_to_current_transition.append({'track_id': track_id, 'bbox': bbox, 'relative_distance': relative_distance})
-            #
-            # nearest_door = sorted(potential_doors_to_add_to_current_transition, key = lambda x: x['relative_distance'])[0]
-            # door_only_pic = self.crop_bbox_from_pil(pil_image, nearest_door['bbox'])
-            # if nearest_door['track_id'] > -1: # only add it if we've got a history of tracking it
-            #     self.add_door_in_current_transition_run(nearest_door['track_id'], nearest_door['bbox'], door_only_pic)
-            #     #print("AE: Adding track_id to self.doors_in_current_transition_run : ", nearest_door)
-
-            # TODO: see above
-            # this one is all doors in frame
+            # Now go through all items detected in the image and crop the doors, so that we store them for later.
+            # Take note of the track_id for each door- we'll use that to analyze different tracks and estimate
+            # which track_id designates a specific sequence of the doors of interest (sequence of doors for the
+            # current transition, for example).
             for item in item_infos:
                 if item['name'] == 'OPENDOOR':
                     track_id = item['track_id']
                     bbox = item['bbox']
                     door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
 
-                    # TODO: Only add the nearest door if there are several.
                     if track_id > -1:
                         self.add_door_in_current_transition_run(track_id, bbox, door_only_pic, pil_image)
-                    #print("AE: Adding track_id to self.doors_in_current_transition_run : ", track_id)
         else:
             self.open_door_incidence_last10.append(False)
-            self.open_door_track_ids_last_x.append([])
             #print("AE: Adding door_track_ids: NONE")
 
         if len(self.open_door_incidence_last10) > 10:
@@ -460,7 +423,6 @@ class SemanticNavigationClient:
         if len(self.fpv_images_last_x) > self.IMGS_TO_KEEP:
             #self.fpv_images_last_x = self.fpv_images_last_x[1:]
             self.fpv_images_last_x.pop(0)
-            self.open_door_track_ids_last_x.pop(0)
 
         # If room transition spotted, then we want to manage objects seen in the previous room
         if room_transition_spotted:
@@ -529,46 +491,39 @@ class SemanticNavigationClient:
 
         result = (None, None)
 
+        # If we have at least five doors in the recent history, then start querying if we know anything about them
+        # because we could be near a transit to another room.
+        # Here we asemble the last few pictures from history and send them all to embed and compare with records in
+        # the vector databse to know if we have seen similar sequence before, indicating whether we've crossed this door
+        # or not.
         if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5 and not self.DEBUG:#self.IMGS_TO_EMBED:
-        #if room_transition_spotted:
-            #imgs_to_embed = self.fpv_images_last_x[5:]
             imgs_to_embed = self.fpv_images_last_x[-5:]  # get last images -- self.IMGS_TO_EMBED
             qry_result = self.qry_door_transition(np.stack(imgs_to_embed))
-            # if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0:
-            #     print("AE: IMG QUERY: ", qry_result['qry_results'][0], " imgs_cnt: ", len(imgs_to_embed))
 
             if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] >= 0.92:
+                # we are recognizing a transit through a door that we have done before
+                # TODO: figure out what we want to do with that.
                 best_match = qry_result['qry_results'][0]
-                print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, early_or_late: {best_match['early_or_late']}, conf = {qry_result['qry_results'][0]['similarity']}")
+                print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, conf = {best_match['similarity']}")
                 #self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
 
-                ## Thhis is the original way to ablate doors
-                # # Here we now need to track the past x images with doors in them and I guess find the prevalent track_id of opendoors objects in the recent
-                # # history. And then mark that ID as the forbidden door so that we can paint the grey box over it.
-                # most_common_track_id = self.most_common_door_track_id_in_recent_history()
-                # # this is the forbidden door: most_common_track_id
-                #
-                # bbox_to_cover = None
-                # for item in item_infos:
-                #     if item['track_id'] == most_common_track_id and item['name'] == 'OPENDOOR':
-                #         bbox_to_cover = item['bbox']
-                # if bbox_to_cover == []: bbox_to_cover = None
-                # result = (bbox_to_cover, best_match['early_or_late'])
-
-        ## This is the new way (note the nesting level):
+        # Here we have just spotted a door and we want to know if we have seen this door before and whether we want to
+        # paint over it to force SNP to ignore it and look for another door.
         if 'OPENDOOR' in objs_in_image and not self.DEBUG:
             for item in item_infos:
                 if item['name'] == 'OPENDOOR':
                     bbox = item['bbox']
                     door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
                     # If we've spotted an OPENDOOR, then let's query if this door has been seen from other
-                    # angles and distances.
-                    # query if we already know this door. And if we do and it is leading where we don't want to go,
+                    # angles and distances. And if we know this door and it is leading where we don't want to go,
                     # then paint it.
                     stored_door_info = self.qry_door_images_of_transition(door_only_pic)
                     if (self.do_we_need_to_paint_this_door(stored_door_info)):
                         bbox_to_cover = item['bbox']
-                        result = (bbox_to_cover, True)
+                        # The boolean parameter here determines whether we will have the whole picture grayed out (True) or just the door (False)
+                        result = (bbox_to_cover, False)
+                        break # we got the door to cover, there should only be one, so break the loop
+                        # TODO: Potentially there could be more than one door to cover
                         # TODO: clear out the collected door images if we're going to reset the door SNP
 
         if room_transition_spotted:
@@ -576,27 +531,6 @@ class SemanticNavigationClient:
             print("TRANS DR: ", self.prev_room_type, self.current_room_type)
 
         return result
-
-    def most_common_door_track_id_in_recent_history(self):
-        """
-        Here we now need to track the past x images with doors in them and find the prevalent track_id of opendoors objects in the recent
-        history.
-        :return:
-        """
-        track_id_history_of_interest = self.open_door_track_ids_last_x[-10:]
-
-        # empties_discarded = [item for item in self.open_door_track_ids_last_x if len(item) > 0]
-        # track_id_history_of_interest = empties_discarded[-5:]
-
-        # flatten our list of lists
-        track_ids_flat = sum(track_id_history_of_interest, [])
-        #print("AE: track_ids_flat == ", track_ids_flat)
-        if len(track_ids_flat) > 0:
-            track_id_counts = Counter(track_ids_flat)
-            most_common_track_id, count = track_id_counts.most_common(1)[0]
-            return most_common_track_id
-        else:
-            return None
 
     def callback_from_interrupted_snp(self):
         print("AE: SNP INTERRUPTED AND SCENE NAVIGATOR CALLED BACK. Current active: ", self.current_active_SNP)
@@ -609,10 +543,6 @@ class SemanticNavigationClient:
             # TODO: consider door finding task to be a sequence of perimeter SNP until we see a door + door finder
             #  instead of just door finder SNP alone. That should allow for discovery of other doors after we've reset
             #  the RSSM state with the is_first flag.
-            #
-            # TODO: Introduce two levels of transition recognition - the one that we already have (let's call it the
-            #  immediate one) and another one- earlier (call it early one). If we have an immediate transition in front,
-            #  then blat out whole screen. If the early one, then only blat out the door and still reset SNP.
             #self.remedy_commands.append(self.go_to_room_centre)
             self.remedy_commands.append(self.do_random_rotation)
             self.remedy_commands.append(self.go_to_next_room)
@@ -709,9 +639,15 @@ class SemanticNavigationClient:
 
         return {'room_type': room_type, 'item_infos': item_infos}
 
-    def process_room_transition_debug(self):
-        most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
-
+    def prepare_door_pics_and_fpvs_after_door_SNP(self):
+        """
+        So the door finder SNP has completed its job. At some point in the future the SVC will notice that we have
+        changed a room and we will trigger room transition function (self.process_room_transition(...)). For it to work,
+        we need to prepare the self.door_pics, self.whole_transition_pics and self.bboxes collections and do it in
+        such a way that they contain the correct sequence of us transiting the door. This will be analyzed in
+        self.analyze_door_trajectories(...) function called from here.
+        :return:
+        """
         doors_in_current_transition_run_flat = []
         for item in self.doors_in_current_transition_run.items():
             main_track_id = item[0]
@@ -730,9 +666,7 @@ class SemanticNavigationClient:
              item['bbox']
              ) for item in doors_in_current_transition_run_flat]
 
-        print("AE: self.doors_in_current_transition_run : ", [(info_item[0], info_item[1]) for info_item in doors_infos],
-              " most_common_door_track_id: ", most_common_door_track_id,
-              " self.open_door_track_ids_last_x[-10:]: ", self.open_door_track_ids_last_x[-10:])
+        print("AE: self.doors_in_current_transition_run : ", [(info_item[0], info_item[1]) for info_item in doors_infos])
 
         path_id = "debug_door_pics"
         os.makedirs(path_id, exist_ok=True)
@@ -866,40 +800,17 @@ class SemanticNavigationClient:
             # collected objects need not be erased, but collected for the new room type, which will happen outside this
             # if block.
             if not(self.is_room_nonsense(self.prev_room_type)) and not(self.is_room_nonsense(self.current_room_type)):
-            # this might be a case of walking through an open plan living room into a kitchen (in which case we won't
-            # have a door, or this might be a transition through a door. If it's through a door, then we want to save it
-            #
-            # For now let's detect all transitions regardless of doors.
-            #if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5:
-                #imgs_to_embed = self.fpv_images_last_x[:self.IMGS_TO_EMBED]  # Or save the mid-point transition images
-                # TODO: use the selected door and FPV images during door SNP
-                #imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_IMM_VPR:][:self.IMGS_TO_EMBED] # take first 10 images from the history of 40 back
-                #self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, False)
+                # this might be a case of walking through an open plan living room into a kitchen (in which case we won't
+                # have a door, or this might be a transition through a door. Regardless of doors, if we have changed a room
+                # type, then we store the transition
                 self.store_door_transition(np.stack(self.whole_transition_pics), self.prev_room_type, self.current_room_type, False)
 
-                # now let's see if we have enough imagery for an early transition storage
-                # if len(self.fpv_images_last_x) >= self.IMG_HISTORY_FOR_EARLY_VPR:
-                #     imgs_to_embed = self.fpv_images_last_x[-self.IMG_HISTORY_FOR_EARLY_VPR:][:self.IMGS_TO_EMBED]  # take first 10 images from the history of 40 back
-                #     self.store_door_transition(np.stack(imgs_to_embed), self.prev_room_type, self.current_room_type, True)
-                # if len(self.door_pics) >= 0:
-                #     self.store_door_transition(np.stack(self.door_pics), self.prev_room_type, self.current_room_type, True)
-
-                # Now that we've stored transition to a new room, let's also store the looks of the door that brought us there
-                # The most commond door track ID in the recent history (something like last 10 images) should be the door that's
-                # lead us to the new room.
-                #most_common_door_track_id = self.most_common_door_track_id_in_recent_history()
-                most_common_door_track_id = 1 # not relying on it anymore
-                if most_common_door_track_id is not None:
-                    #door_pics_infos_to_store = [(item['door_pic'], item['bbox']) for item in self.doors_in_current_transition_run if item['track_id'] == most_common_door_track_id]
-                    # Store door pics to vector DB pertaining to this transition.
-                    # TODO: Why we didn't get DOORPICS when transiting from BEDROOM to LIVING_ROOM?
-                    #if len(door_pics_infos_to_store) > 0:
-                    if len(self.door_pics) > 0:
-                        self.store_door_images_of_transition(list(zip(self.door_pics, self.bboxes)), self.prev_room_type, self.current_room_type)
-                    else:
-                        # TODO: Remove this branch once we have confirmed that this condition is fixed and does not happen anymore
-                        print("AE: self.doors_in_current_transition_run : ", [item['track_id'] for item in self.doors_in_current_transition_run.values()], " most_common_door_track_id: ", most_common_door_track_id, " self.open_door_track_ids_last_x[-10:]: ", self.open_door_track_ids_last_x[-10:])
-                        exit()
+                # Now that we've stored transition to a new room, let's also store the looks of the door that brought us
+                # here. Store door pics to vector DB pertaining to this transition.
+                if len(self.door_pics) > 0:
+                    self.store_door_images_of_transition(list(zip(self.door_pics, self.bboxes)), self.prev_room_type, self.current_room_type)
+                else:
+                    print("AE: Room transition triggered, but not door pictures available: ", [item['track_id'] for item in self.doors_in_current_transition_run.values()])
 
                 self.reset_seen_objs()
                 self.reset_doors_in_current_transition_run()
@@ -929,7 +840,7 @@ class SemanticNavigationClient:
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
         # trigger here a transition to a new room - store door images that we may have just seen
-        self.process_room_transition_debug()
+        self.prepare_door_pics_and_fpvs_after_door_SNP()
         print("AE: DOOR_FINDER ended")
 
     def go_to_perimeter_of_room(self):
@@ -1047,7 +958,7 @@ class SemanticNavigationClient:
             print(f"Error receiving response: {e}")
             return None
 
-    def store_door_transition(self, path_imgs, room_from, room_to, early_or_late):
+    def store_door_transition(self, path_imgs, room_from, room_to, early_or_late = False):
         """
         Send an a collection of images, representing a door entrance, to server.
 
@@ -1056,7 +967,7 @@ class SemanticNavigationClient:
         :param path_imgs:
         :param room_from:
         :param room_to:
-        :param early_or_late: is this an early (door still quite far) or late (already going through) VPR for a door transition
+        :param early_or_late: is this an early (door still quite far) or late (already going through) VPR for a door transition. Now defunct parameter
         :return:
 
         Returns:
@@ -1076,7 +987,7 @@ class SemanticNavigationClient:
 
         ## debug
         self.door_transitions_stored += 1
-        path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored) + "_" + ('EARLY' if early_or_late else 'IMM')
+        path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored)# + "_" + ('EARLY' if early_or_late else 'IMM')
         os.makedirs(path_id, exist_ok=True)
         cnt = 0
         #print("STORING ", len(path_imgs), " images. early_or_late = ", early_or_late)
@@ -1125,85 +1036,6 @@ class SemanticNavigationClient:
         except zmq.ZMQError as e:
             print(f"Error receiving response: {e}")
             return None
-
-    def store_ref_path(self, path_imgs, path_id="?"):
-        """
-        Send an a collection of images, representing a reference path, to server.
-
-        Args:
-            image_np: numpy array (x, H, W, C) in BGR order (typical from OpenCV/AI2-THOR)
-
-        Returns:
-            success flag or None if error
-        """
-        # Serialize the images
-        data = {
-            'shape': path_imgs.shape,
-            'dtype': str(path_imgs.dtype),
-            'bytes': path_imgs.tobytes(),
-            'path_id': path_id,
-            'action': "store_ref_path",
-            'module': "path_comparator"
-        }
-
-        ## debug
-        path_id = str(path_id)
-        os.makedirs(path_id, exist_ok=True)
-        cnt = 0
-        for img in path_imgs:
-            cnt += 1
-            cv2.imwrite(os.path.join(path_id, str(cnt) + ".png"), img)
-        ## /debug
-
-        # Send request
-        self.llm_socket.send_pyobj(data)
-
-        # Wait for response (this BLOCKS until Jetson replies)
-        try:
-            response = self.llm_socket.recv_pyobj()
-            return response
-        except zmq.ZMQError as e:
-            print(f"Error receiving response: {e}")
-            return None
-
-    def qry_path_similarity(self, path_imgs):
-        """
-        Main navigation loop with real-time confidence feedback.
-
-        Args:
-            get_image_func: Function that captures current FPV image from AI2-THOR
-            max_steps: Maximum number of steps to take
-        """
-        data = {
-            'shape': path_imgs.shape,
-            'dtype': str(path_imgs.dtype),
-            'bytes': path_imgs.tobytes(),
-            'action': "qry_path_similarity",
-            'module': "path_comparator"
-        }
-
-        ## debug
-        path_id = "tmp_cmp"
-        os.makedirs(path_id, exist_ok=True)
-        cnt = 0
-        for img in path_imgs:
-            cnt += 1
-            cv2.imwrite(os.path.join(path_id, str(cnt) + ".png"), img)
-        ## /debug
-
-        # Send request
-        self.llm_socket.send_pyobj(data)
-
-        # Wait for response (this BLOCKS until Jetson replies)
-        try:
-            response = self.llm_socket.recv_pyobj()
-            return response
-        except zmq.ZMQError as e:
-            print(f"Error receiving response: {e}")
-            return None
-
-        # Small delay to avoid overwhelming the system
-        time.sleep(0.05)
 
     def crop_bbox_from_pil(self, pil_image, bbox):
         """
@@ -1354,22 +1186,6 @@ if __name__ == "__main__":
     #
     # # Embedding of a path
     # ref_path1 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/1")
-    # ref_path2 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/2")
-    # ref_path3 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/3")
-    # ref_path4 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/4")
-    # ref_path7 = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/7")
-    #
-    # ref_cmp_path = load_path("/home/hp20024/robotics/latent_planning/snp_dreamerv3/ai2_thor_model_training_src/thortils/scripts/tmp_cmp")
-    #
-    # agent.store_ref_path(ref_path1, "ref_path1")
-    # agent.store_ref_path(ref_path2, "ref_path2")
-    # agent.store_ref_path(ref_path3, "ref_path3")
-    # agent.store_ref_path(ref_path4, "ref_path4")
-    # agent.store_ref_path(ref_path7, "ref_path7")
-    #
-    # # Comparison of a path against stored embedded ones
-    # path_cmp_res = agent.qry_path_similarity(ref_cmp_path)
-    # print("AE: path_cmp res: ", path_cmp_res)
 
     # #agent.scene_navigator.process_habitat(10)
     # agent.go_to_room_centre()
@@ -1382,18 +1198,6 @@ if __name__ == "__main__":
     # print("While going to RC, I saw: ", agent.objs_in_current_room)
     # print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room,
     #                                                      np.stack([agent.rc_action_gen.last_image_large], axis=0)))
-    #
-    # agent.reset_seen_objs()
-    # agent.scene_navigator.load_next_placement()
-    # agent.go_to_room_centre()
-    # print("While going to RC, I saw: ", agent.objs_in_current_room)
-    # print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room,
-    #                                                      np.stack([agent.rc_action_gen.last_image_large], axis=0)))
-
-    # agent.go_to_room_centre()
-    # print("While going to RC, I saw: ", agent.objs_in_current_room)
-    # #print(agent.classify_room_by_this_object_set_and_pic(agent.objs_in_current_room, np.stack([agent.rc_action_gen.last_image_large], axis=0)))
-    # print(agent.quick_classify_room_by_this_object_set(agent.objs_in_current_room))
 
     agent.reset_seen_objs()
     rooms_to_traverse = 7
@@ -1404,5 +1208,3 @@ if __name__ == "__main__":
         agent.add_main_command(agent.go_to_perimeter_of_room)
 
     agent.do_work()
-
-    # TODO: Next step: implement not going through a visited door again during exploration.
