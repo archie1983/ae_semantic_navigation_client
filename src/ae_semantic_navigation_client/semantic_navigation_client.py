@@ -19,9 +19,10 @@ class ActionGenerator:
             cmd = "genact"
         )
         self.socket = dreamer_socket
+        self.image_receiver = None
+        self.snp_reset_procedure = None
         self.reset()
         self.handshake_received = False
-        self.image_receiver = None
         self.last_image_large = None
         self.img_cnt = 0
 
@@ -33,6 +34,8 @@ class ActionGenerator:
         self._cur_obs["is_first"] = True
         self._cur_obs["is_last"] = False
         self.steps_after_reset = 0
+        if self.snp_reset_procedure is not None:
+            self.snp_reset_procedure()
 
     def stop_received(self):
         self._cur_obs["is_first"] = False
@@ -66,10 +69,13 @@ class ActionGenerator:
         """
         self.image_receiver = image_receiver
 
+    def set_client_procedure_for_snp_reset(self, snp_reset_procedure):
+        self.snp_reset_procedure = snp_reset_procedure
+
     def __call__(self, ai2_thor_image):
         self.handshake()
 
-        bbox_to_cover = None
+        bboxes_to_cover = None
         # Create a working copy so we don't permanently alter the simulation telemetry frame
         processed_image = ai2_thor_image.copy()
 
@@ -81,29 +87,30 @@ class ActionGenerator:
         if self.image_receiver is not None:
             vpr_info = self.image_receiver(pil_image_large)
             if vpr_info is not None:
-                bbox_to_cover, full_cover = vpr_info
+                bboxes_to_cover, full_cover = vpr_info
             else:
-                bbox_to_cover = None
+                bboxes_to_cover = None
                 full_cover = None
             self.last_image_large = pil_image_large
 
         # If we got back bbox_to_cover then we need to ablate that in the image before passing back to the SNP
-        if bbox_to_cover is not None:
+        if bboxes_to_cover is not None and len(bboxes_to_cover) > 0:
             # if full cover of image is not required, then just paint over the doors
             if not full_cover:
-                print("AE: painting DOOR only bbox_to_cover: ", bbox_to_cover, " shape: ", processed_image.shape)
-                # bbox expected format: [xmin, ymin, xmax, ymax]
-                xmin, ymin, xmax, ymax = map(int, bbox_to_cover)
-                # Paint a solid neutral grey polygon (128, 128, 128) over the door
-                cv2.rectangle(
-                    processed_image,
-                    (xmin, ymin),
-                    (xmax, ymax),
-                    (128, 128, 128),
-                    thickness=-1  # -1 fills the interior entirely
-                )
+                for bbox_to_cover in bboxes_to_cover:
+                    print("AE: painting DOOR only bbox_to_cover: ", bbox_to_cover, " shape: ", processed_image.shape)
+                    # bbox expected format: [xmin, ymin, xmax, ymax]
+                    xmin, ymin, xmax, ymax = map(int, bbox_to_cover)
+                    # Paint a solid neutral grey polygon (128, 128, 128) over the door
+                    cv2.rectangle(
+                        processed_image,
+                        (xmin, ymin),
+                        (xmax, ymax),
+                        (128, 128, 128),
+                        thickness=-1  # -1 fills the interior entirely
+                    )
             else: # otherwise blank out all
-                print("AE: painting BLOCKING bbox_to_cover: ", bbox_to_cover, " shape: ", processed_image.shape)
+                print("AE: painting BLOCKING bbox_to_cover: ", bboxes_to_cover, " shape: ", processed_image.shape)
                 cv2.rectangle(
                     processed_image,
                     (0, 0),
@@ -134,7 +141,7 @@ class ActionGenerator:
         rgb_img_64x64 = cv2.cvtColor(img_64x64, cv2.COLOR_BGR2RGB)
         pil_image_64x64 = Image.fromarray(rgb_img_64x64)
 
-        if bbox_to_cover is not None:
+        if bboxes_to_cover is not None and len(bboxes_to_cover) > 0:
             ## debug
             path_id = "masked_doors"
             os.makedirs(path_id, exist_ok=True)
@@ -480,6 +487,16 @@ class SemanticNavigationClient:
         else:
             return False
 
+    def actions_to_do_when_snp_reset(self):
+        """
+        If the SNP needs to reset, we may want to do something with the client- like clearing out current door collection
+        :return:
+        """
+        self.reset_doors_in_current_transition_run()
+        # TODO: We execute this when door finder SNP has to paint over a known door and reset.
+        #  do we want to process door images with: self.prepare_door_pics_and_fpvs_after_door_SNP(...) and store them
+        #  in such case? To improve the detection and next time recognize such doors from further away.
+
     def process_incoming_image_dr(self, pil_image):
         '''
         Receive an image on every step during DR SNP work and process it.
@@ -510,6 +527,7 @@ class SemanticNavigationClient:
         # Here we have just spotted a door and we want to know if we have seen this door before and whether we want to
         # paint over it to force SNP to ignore it and look for another door.
         if 'OPENDOOR' in objs_in_image and not self.DEBUG:
+            bboxes_to_cover = []
             for item in item_infos:
                 if item['name'] == 'OPENDOOR':
                     bbox = item['bbox']
@@ -519,12 +537,10 @@ class SemanticNavigationClient:
                     # then paint it.
                     stored_door_info = self.qry_door_images_of_transition(door_only_pic)
                     if (self.do_we_need_to_paint_this_door(stored_door_info)):
-                        bbox_to_cover = item['bbox']
+                        bboxes_to_cover.append(item['bbox'])
                         # The boolean parameter here determines whether we will have the whole picture grayed out (True) or just the door (False)
-                        result = (bbox_to_cover, False)
-                        break # we got the door to cover, there should only be one, so break the loop
-                        # TODO: Potentially there could be more than one door to cover
-                        # TODO: clear out the collected door images if we're going to reset the door SNP
+                        result = (bboxes_to_cover, False)
+                        #break # we got the door to cover, there should only be one, so break the loop - NOT REALLY, let's get all images that need painting over
 
         if room_transition_spotted:
             #print("TRANS DR: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
@@ -834,6 +850,7 @@ class SemanticNavigationClient:
         :return:
         """
         self.dr_action_gen.set_image_receiver(self.process_incoming_image_dr)
+        self.dr_action_gen.set_client_procedure_for_snp_reset(self.actions_to_do_when_snp_reset)
         self.scene_navigator.set_action_gen(self.dr_action_gen)
         self.current_active_SNP = SNPType.DOOR_FINDER
         print("AE: DOOR_FINDER started")
