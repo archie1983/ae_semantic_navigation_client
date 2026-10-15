@@ -321,7 +321,7 @@ class SemanticNavigationClient:
 
         # Look at this track id in the history. If the current occupation is similar to last one, then add,
         # if not, then rename previous track_ids to something new and store this with the current track id
-        _, cur_relative_distance = self.check_door_proximity(bbox)
+        _, cur_relative_distance, _, _ = self.check_door_proximity(bbox)
         if track_id in self.doors_in_current_transition_run.keys():
             # only treat this image as belonging to the same track_id if the difference between this and previous
             # relative distances is less than 10%
@@ -444,15 +444,15 @@ class SemanticNavigationClient:
 
         return item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted
 
-    def check_door_proximity(self, bbox, image_height=600, min_percentage=0.25):
+    def check_door_proximity(self, bbox, frame_width=600, frame_height=600, centering_threshold=0.30, proximity_threshold=0.35):
         """
         Checks if a door is close enough to confidently identify/block,
         using a normalized vertical scale factor to bypass width variations.
 
         Args:
             bbox: List [xmin, ymin, xmax, ymax]
-            image_height: The absolute height of the raw camera frame (e.g., 600)
-            min_percentage: The minimum portion of the screen height the door must occupy
+            frame_height: The absolute height of the raw camera frame (e.g., 600)
+            proximity_threshold: The minimum portion of the screen height the door must occupy
         """
         xmin, ymin, xmax, ymax = bbox
 
@@ -460,13 +460,31 @@ class SemanticNavigationClient:
         door_pixel_height = ymax - ymin
 
         # Calculate what percentage of the camera's field of view the door height occupies
-        occupancy_ratio = door_pixel_height / image_height
+        occupancy_ratio = door_pixel_height / frame_height
 
         # If occupancy ratio is 0.25, the door takes up 25% of the frame vertically
-        if occupancy_ratio >= min_percentage:
-            return True, occupancy_ratio
+        is_near = occupancy_ratio >= proximity_threshold
 
-        return False, occupancy_ratio
+        # Centering Calculation
+        # Find the horizontal center point of the door's bounding box
+        door_center_x = (xmin + xmax) / 2.0
+        # Find the ideal center point of the camera sensor
+        frame_center_x = frame_width / 2.0
+
+        # Calculate absolute horizontal pixel offset from center
+        pixel_offset_x = door_center_x - frame_center_x
+
+        # Normalize the offset relative to total width so it scales across different resolution configurations
+        normalized_offset_x = abs(pixel_offset_x) / frame_width
+        is_centered = normalized_offset_x <= centering_threshold
+
+        metrics = {
+            'occupancy_ratio': round(occupancy_ratio, 4),
+            'normalized_offset': round(normalized_offset_x, 4),
+            'pixel_offset': pixel_offset_x  # Positive means door is to the right, negative means left
+        }
+
+        return is_near, occupancy_ratio, is_centered, metrics
 
     def do_we_need_to_paint_this_door(self, stored_door_info):
         if ((stored_door_info['qry_results'] and
@@ -513,20 +531,22 @@ class SemanticNavigationClient:
         # Here we asemble the last few pictures from history and send them all to embed and compare with records in
         # the vector databse to know if we have seen similar sequence before, indicating whether we've crossed this door
         # or not.
-        if sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5 and not self.DEBUG:#self.IMGS_TO_EMBED:
+        if False and sum(self.open_door_incidence_last10) > 5 and len(self.fpv_images_last_x) > 5 and not self.DEBUG:#self.IMGS_TO_EMBED:
             imgs_to_embed = self.fpv_images_last_x[-5:]  # get last images -- self.IMGS_TO_EMBED
             qry_result = self.qry_door_transition(np.stack(imgs_to_embed))
 
             if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0 and qry_result['qry_results'][0]['similarity'] >= 0.92:
                 # we are recognizing a transit through a door that we have done before
-                # TODO: figure out what we want to do with that.
+                # TODO: figure out what we want to do with that. - This is where we recognize a transit to another room
+                #   (could be anything in the FPV- not just doors). The other place is where we spot a door and want to
+                #   understand if it's a door that we want to block before we've come any closer.
                 best_match = qry_result['qry_results'][0]
                 print(f"I am 100% sure I am walking from {best_match['room_from']} to {best_match['room_to']}, conf = {best_match['similarity']}")
                 #self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
 
         # Here we have just spotted a door and we want to know if we have seen this door before and whether we want to
         # paint over it to force SNP to ignore it and look for another door.
-        if 'OPENDOOR' in objs_in_image and not self.DEBUG:
+        if False and 'OPENDOOR' in objs_in_image and not self.DEBUG:
             bboxes_to_cover = []
             for item in item_infos:
                 if item['name'] == 'OPENDOOR':
@@ -561,6 +581,7 @@ class SemanticNavigationClient:
             #  the RSSM state with the is_first flag.
             #self.remedy_commands.append(self.go_to_room_centre)
             self.remedy_commands.append(self.do_random_rotation)
+            self.remedy_commands.append(self.go_to_perimeter_of_room)
             self.remedy_commands.append(self.go_to_next_room)
             self.dr_action_gen.reset()
         elif self.current_active_SNP == SNPType.ROOM_CENTRE_FINDER:
@@ -598,9 +619,36 @@ class SemanticNavigationClient:
 
         # Not sure what else we might want to do in the perimeter finder - at least for now while I'm focussing on environment exploration.
 
-        # Run perimeter finder for 100 steps only to promote room exploration before we resort to RC SNP
-        if self.per_action_gen.steps_after_reset >= 50:
-            self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+        # # Run perimeter finder for 100 steps only to promote room exploration before we resort to RC SNP
+        # if self.per_action_gen.steps_after_reset >= 50:
+        #     self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+
+        # If we spot a door and it's sufficiently close and more or less centered within the screen, then
+        # we want to interrupt this perimeter finder SNP and let the system continue with door finder SNP.
+        if 'OPENDOOR' in objs_in_image and not self.DEBUG:
+            for item in item_infos:
+                if item['name'] == 'OPENDOOR':
+                    bbox = item['bbox']
+                    door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
+                    # If we've spotted an OPENDOOR, then let's query if this door has been seen from other
+                    # angles and distances. And if we don't know this door, then we want to interrupt this SNP
+                    # so that door finder can take over and go through.
+                    stored_door_info = self.qry_door_images_of_transition(door_only_pic)
+
+                    if ((stored_door_info['qry_results'] and
+                         len(stored_door_info['qry_results']) > 0 and
+                         stored_door_info['qry_results'][0]['similarity'] > 0.8)
+                            and (stored_door_info['qry_results'][0]['room_from'] == self.current_room_type.name)):
+                        known_door = True
+                    else:
+                        known_door = False
+
+                    door_is_near, _, door_is_centered, metrics = self.check_door_proximity(item['bbox'])
+                    if door_is_near and door_is_centered and not known_door:
+                        print("AE: PER interrupting: ", metrics)
+                        self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                    else:
+                        print("AE: per not reset: ", metrics, " known_door: ", known_door)
 
     def update_room_detections_after_instability(self, instability_info):
         if instability_info is None or len(instability_info) <= 0: return
