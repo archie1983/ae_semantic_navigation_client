@@ -305,6 +305,7 @@ class SemanticNavigationClient:
         self.door_pics = []
         self.bboxes = []
         self.whole_transition_pics = []
+        self.transition_likely_happened = False
 
     def reset_doors_in_current_transition_run(self):
         self.doors_in_current_transition_run = dict()
@@ -393,7 +394,8 @@ class SemanticNavigationClient:
                 most_common_room, count = room_counts.most_common(1)[0]
 
                 # Only transition if the dominant room has changed AND meets a threshold (e.g., 7/10 frames)
-                if most_common_room != self.current_room_type and count >= 6:
+                #if most_common_room != self.current_room_type and count >= 6:
+                if count >= 6 and self.transition_likely_happened and not self.is_room_nonsense(most_common_room): # this should detect even cases where we went from one BEDROOM to another BEDROOM
                     # Trigger your embedding storage and transition mechanics here
                     self.prev_room_type = self.current_room_type
                     self.current_room_type = most_common_room
@@ -433,7 +435,8 @@ class SemanticNavigationClient:
             self.fpv_images_last_x.pop(0)
 
         # If room transition spotted, then we want to manage objects seen in the previous room
-        # TODO: Handle when one of the rooms is NOT_KNOWN, so that we avoid rogue transitions and delay the registration of the transition until we know both room types
+        # TODO: Handle when one of the rooms is NOT_KNOWN, so that we avoid rogue transitions and delay the
+        #  registration of the transition until we know both room types
         if room_transition_spotted:
             self.process_room_transition(skip_storing_data=self.DEBUG)
 
@@ -787,7 +790,7 @@ class SemanticNavigationClient:
             cv2.imwrite(os.path.join(path_id, f"{item['track_id']}_{prox}_w.png"), img_np_whole)
 
         # group the self.doors_in_current_transition_run items by track_id
-        analysis_report, target_tracks, self.door_pics, self.whole_transition_pics, self.bboxes = self.analyze_door_trajectories(doors_infos)
+        analysis_report, target_tracks, self.door_pics, self.whole_transition_pics, self.bboxes, self.transition_likely_happened = self.analyze_door_trajectories(doors_infos)
 
         for tid in sorted(analysis_report.keys(), key=lambda x: str(x)):
             stats = analysis_report[tid]
@@ -872,6 +875,7 @@ class SemanticNavigationClient:
         target_tracks = [item for item in target_tracks if item[2] > 0.85]  # enforce peak occupancy
         target_tracks = sorted(target_tracks, key=lambda x: x[1]) # sort by frame count
 
+        transition_likely_happened = False
         #print(target_tracks)
         if (len(target_tracks) < 1):
             print("BAD TRACKS")
@@ -880,7 +884,10 @@ class SemanticNavigationClient:
                 print(
                     f"Track ID {tid:4d} | Frames: {stats['frame_count']:2d} | Peak Occupancy: {stats['max_occupancy']:.2f} | Trend: {stats['trend']:+.2f}")
             #exit()
-            return analysis_report, target_tracks, [], [], bboxes
+            return analysis_report, target_tracks, [], [], bboxes, transition_likely_happened
+
+        transition_likely_happened = True # if we're here, then we have at least one target track that qualifies with
+        # peak occupancy, so we can assume that transition actually happened
 
         chosen_track_id = target_tracks[-1][0]
         #print("chosen_track_id: ", chosen_track_id)
@@ -888,7 +895,7 @@ class SemanticNavigationClient:
         chosen_whole_pics = analysis_report[chosen_track_id]['whole_pics']
         bboxes = analysis_report[chosen_track_id]['bboxes']
 
-        return analysis_report, target_tracks, chosen_door_pics, chosen_whole_pics, bboxes
+        return analysis_report, target_tracks, chosen_door_pics, chosen_whole_pics, bboxes, transition_likely_happened
 
     def process_room_transition(self, skip_storing_data = False):
         """
