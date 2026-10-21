@@ -499,11 +499,11 @@ class SemanticNavigationClient:
 
         return is_near, occupancy_ratio, is_centered, metrics
 
-    def is_this_door_known(self, pil_image, bbox):
+    def is_this_door_known(self, pil_image, bbox, source_snp = "DR"):
         door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
         # If we've spotted an OPENDOOR, then let's query if this door has been seen from other
         # angles and distances.
-        stored_door_info = self.qry_door_images_of_transition(door_only_pic)
+        stored_door_info = self.qry_door_images_of_transition(door_only_pic, source_snp)
 
         if ((stored_door_info['qry_results'] and
                 len(stored_door_info['qry_results']) > 0 and
@@ -623,7 +623,7 @@ class SemanticNavigationClient:
                          'similarity': -1.0}
             door_known = False
 
-        return {'door_known': door_known, 'door_info': door_info, 'bbox':bbox}
+        return {'door_known': door_known, 'door_info': door_info, 'bbox': bbox}
 
     def callback_from_interrupted_snp(self):
         print("AE: SNP INTERRUPTED AND SCENE NAVIGATOR CALLED BACK. Current active: ", self.current_active_SNP)
@@ -687,15 +687,21 @@ class SemanticNavigationClient:
         # this perimeter finder SNP and let the system continue with door finder SNP.
         if len(unknown_door_bboxes) > 0:
             for bbox in unknown_door_bboxes:
-                door_is_near, occupancy, door_is_centered, metrics = self.check_door_proximity(bbox)
-                if door_is_near and door_is_centered:
-                    print("AE: PER interrupting: ", metrics)
+
+                if not self.is_this_door_known(pil_image, bbox, source_snp="PER"):
+                    print("AE: PER interrupting: unknown bbox: ", bbox)
                     self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
                     break
-                else:
-                    # TODO: Should we center the agent to face the door if the only problem was centering
-                    #  and launch DR SNP anyway?
-                    print("AE: per not reset, unknown door not qualified: ", metrics)
+
+                # door_is_near, occupancy, door_is_centered, metrics = self.check_door_proximity(bbox)
+                # if door_is_near and door_is_centered:
+                #     print("AE: PER interrupting: ", metrics)
+                #     self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                #     break
+                # else:
+                #     # TODO: Should we center the agent to face the door if the only problem was centering
+                #     #  and launch DR SNP anyway?
+                #     print("AE: per not reset, unknown door not qualified: ", metrics)
 
     def update_room_detections_after_instability(self, instability_info):
         if instability_info is None or len(instability_info) <= 0: return
@@ -750,15 +756,7 @@ class SemanticNavigationClient:
 
         return {'room_type': room_type, 'item_infos': item_infos}
 
-    def prepare_door_pics_and_fpvs_after_door_SNP(self):
-        """
-        So the door finder SNP has completed its job. At some point in the future the SVC will notice that we have
-        changed a room and we will trigger room transition function (self.process_room_transition(...)). For it to work,
-        we need to prepare the self.door_pics, self.whole_transition_pics and self.bboxes collections and do it in
-        such a way that they contain the correct sequence of us transiting the door. This will be analyzed in
-        self.analyze_door_trajectories(...) function called from here.
-        :return:
-        """
+    def extract_door_infos_from_current_run(self, debug=False):
         doors_in_current_transition_run_flat = []
         for item in self.doors_in_current_transition_run.items():
             main_track_id = item[0]
@@ -777,26 +775,76 @@ class SemanticNavigationClient:
              item['bbox']
              ) for item in doors_in_current_transition_run_flat]
 
-        print("AE: self.doors_in_current_transition_run : ", [(info_item[0], info_item[1]) for info_item in doors_infos])
+        if debug:
+            print("AE: self.doors_in_current_transition_run : ", [(info_item[0], info_item[1]) for info_item in doors_infos])
 
-        path_id = "debug_door_pics"
-        os.makedirs(path_id, exist_ok=True)
-        for item in doors_in_current_transition_run_flat:
-            img_np = np.array(item['door_pic'])
-            img_np_whole = np.array(item['whole_pic'])
-            prox = float(np.round(self.check_door_proximity(item['bbox'])[1], 2))
-            prox = str(prox).replace('.', '_')
-            cv2.imwrite(os.path.join(path_id, f"{item['track_id']}_{prox}.png"), img_np)
-            cv2.imwrite(os.path.join(path_id, f"{item['track_id']}_{prox}_w.png"), img_np_whole)
+            path_id = "debug_door_pics"
+            os.makedirs(path_id, exist_ok=True)
+            for item in doors_in_current_transition_run_flat:
+                img_np = np.array(item['door_pic'])
+                img_np_whole = np.array(item['whole_pic'])
+                prox = float(np.round(self.check_door_proximity(item['bbox'])[1], 2))
+                prox = str(prox).replace('.', '_')
+                cv2.imwrite(os.path.join(path_id, f"{item['track_id']}_{prox}.png"), img_np)
+                cv2.imwrite(os.path.join(path_id, f"{item['track_id']}_{prox}_w.png"), img_np_whole)
+
+        return doors_infos
+
+    def prepare_door_pics_and_fpvs_after_door_SNP(self):
+        """
+        So the door finder SNP has completed its job. At some point in the future the SVC will notice that we have
+        changed a room and we will trigger room transition function (self.process_room_transition(...)). For it to work,
+        we need to prepare the self.door_pics, self.whole_transition_pics and self.bboxes collections and do it in
+        such a way that they contain the correct sequence of us transiting the door. This will be analyzed in
+        self.analyze_door_trajectories(...) function called from here.
+        :return:
+        """
+        doors_infos = self.extract_door_infos_from_current_run(debug=True)
 
         # group the self.doors_in_current_transition_run items by track_id
         analysis_report, target_tracks, self.door_pics, self.whole_transition_pics, self.bboxes, self.transition_likely_happened = self.analyze_door_trajectories(doors_infos)
 
-        for tid in sorted(analysis_report.keys(), key=lambda x: str(x)):
-            stats = analysis_report[tid]
-            print(
-                f"Track ID {tid} | Frames: {stats['frame_count']:2d} | Peak Occupancy: {stats['max_occupancy']:.2f} | Trend: {stats['trend']:+.2f}")
+        self.store_tracked_pics_for_debug(target_tracks)
 
+    def store_door_pics_and_fpvs_after_perimeter_SNP(self):
+        """
+        So the perimeter walker SNP has finished and we probably stopped because we saw a door that needs investigation.
+        The problem is that we saw the door from some specific angle, where this SNP brough us. Now that we will start
+        door finder SNP, it may well take us elsewhere in the room and go through this door from a different angle.
+        In the end the currently stored and tracked images will not be used to register the transition and next time
+        perimeter finder brings us here, we will trigger again thinking that it's a new door. Therefore we need to
+        prepare door images for PER SNP so that we can send them to the vector DB and not trigger on them again.
+        :return:
+        """
+        doors_infos = self.extract_door_infos_from_current_run(debug=True)
+
+        # group the self.doors_in_current_transition_run items by track_id
+        # don't set self.transition_likely_happened because we don't really want to process a transition yet- that will
+        # be done by door SNP.
+        analysis_report, target_tracks, self.door_pics, self.whole_transition_pics, self.bboxes, _ = self.analyze_door_trajectories(doors_infos)
+        #self.store_tracked_pics_for_debug(target_tracks)
+
+        if len(self.whole_transition_pics) > 0:
+            # this might be a case of walking through an open plan living room into a kitchen (in which case we won't
+            # have a door, or this might be a transition through a door. Regardless of doors, if we have changed a room
+            # type, then we store the transition
+            # self.store_door_transition(np.stack(self.whole_transition_pics), self.prev_room_type, self.current_room_type,
+            #                            False)
+
+            # Now that we've stored transition to a new room, let's also store the looks of the door that brought us
+            # here. Store door pics to vector DB pertaining to this transition.
+            if len(self.door_pics) > 0:
+                self.store_door_images_of_transition(list(zip(self.door_pics, self.bboxes)), RoomType.NOT_CLASSIFIED,
+                                                     self.current_room_type, source_snp="PER")
+            else:
+                print("AE: PER door storage triggered, but no door pictures available: ",
+                      [item['track_id'] for item in self.doors_in_current_transition_run.values()])
+
+            self.reset_seen_objs()
+            self.reset_doors_in_current_transition_run()
+            self.reset_door_transition_pics()
+
+    def store_tracked_pics_for_debug(self, target_tracks):
         path_id = "debug_chosen_door_pics"
         cnt = 0
         os.makedirs(path_id, exist_ok=True)
@@ -871,18 +919,18 @@ class SemanticNavigationClient:
             # 4) take one with most frames
             target_tracks.append((track_id, frame_count, max_ratio))
 
+        for tid in sorted(analysis_report.keys(), key=lambda x: str(x)):
+            stats = analysis_report[tid]
+            print(
+                f"Track ID {tid} | Frames: {stats['frame_count']:2d} | Peak Occupancy: {stats['max_occupancy']:.2f} | Trend: {stats['trend']:+.2f}")
+
         target_tracks = target_tracks[-10:] # take last 10
         target_tracks = [item for item in target_tracks if item[2] > 0.85]  # enforce peak occupancy
         target_tracks = sorted(target_tracks, key=lambda x: x[1]) # sort by frame count
 
         transition_likely_happened = False
-        #print(target_tracks)
         if (len(target_tracks) < 1):
             print("BAD TRACKS")
-            for tid in sorted(analysis_report.keys()):
-                stats = analysis_report[tid]
-                print(
-                    f"Track ID {tid:4d} | Frames: {stats['frame_count']:2d} | Peak Occupancy: {stats['max_occupancy']:.2f} | Trend: {stats['trend']:+.2f}")
             #exit()
             return analysis_report, target_tracks, [], [], bboxes, transition_likely_happened
 
@@ -910,6 +958,7 @@ class SemanticNavigationClient:
             if not(self.is_room_nonsense(self.prev_room_type)) and not(self.is_room_nonsense(self.current_room_type)):
                 self.reset_seen_objs()
                 self.reset_doors_in_current_transition_run()
+                self.reset_door_transition_pics()
         else:
             # We want to manage objects seen in the previous room
             # If previous room is defined, then reset objects seen in that room because we will store new objects
@@ -920,11 +969,7 @@ class SemanticNavigationClient:
                 # this might be a case of walking through an open plan living room into a kitchen (in which case we won't
                 # have a door, or this might be a transition through a door. Regardless of doors, if we have changed a room
                 # type, then we store the transition
-                try:
-                    self.store_door_transition(np.stack(self.whole_transition_pics), self.prev_room_type, self.current_room_type, False)
-                except ValueError as e:
-                    print(e, " # self.whole_transition_pics = ", len(self.whole_transition_pics), self.whole_transition_pics)
-                    exit()
+                self.store_door_transition(np.stack(self.whole_transition_pics), self.prev_room_type, self.current_room_type, False)
 
                 # Now that we've stored transition to a new room, let's also store the looks of the door that brought us
                 # here. Store door pics to vector DB pertaining to this transition.
@@ -979,6 +1024,7 @@ class SemanticNavigationClient:
         print("AE: PERIMETER_WALKER started")
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
+        self.store_door_pics_and_fpvs_after_perimeter_SNP()
         print("AE: PERIMETER_WALKER ended")
 
     def do_random_rotation(self):
@@ -992,7 +1038,7 @@ class SemanticNavigationClient:
         self.scene_navigator.navigate_to_goal()
         self.current_active_SNP = SNPType.NONE
 
-    def store_door_images_of_transition(self, door_pics_infos_to_store, room_from, room_to):
+    def store_door_images_of_transition(self, door_pics_infos_to_store, room_from, room_to, source_snp = "DR"):
         """
         Store images of the actual doors when transiting from one room to another.
         Serializes each cropped image into its own byte block to handle varying dimensions.
@@ -1032,6 +1078,7 @@ class SemanticNavigationClient:
             'door_pics': serialized_pics,
             'room_from': room_from.name,
             'room_to': room_to.name,
+            'source_snp': source_snp,
             'door_bboxes': door_bboxes_to_store,
             'action': "store_door_pics_of_transition",
             'module': "path_comparator"
@@ -1060,7 +1107,7 @@ class SemanticNavigationClient:
             print(f"Error receiving response: {e}")
             return None
 
-    def qry_door_images_of_transition(self, door_img):
+    def qry_door_images_of_transition(self, door_img, source_snp = "DR"):
         door_img = np.stack([door_img])
 
         # Serialize the images
@@ -1069,6 +1116,7 @@ class SemanticNavigationClient:
             'dtype': str(door_img.dtype),
             'bytes': door_img.tobytes(),
             'action': "qry_door_pics_of_transition",
+            'source_snp': source_snp,
             'module': "path_comparator"
         }
 
