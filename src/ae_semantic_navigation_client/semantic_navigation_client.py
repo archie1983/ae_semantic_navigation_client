@@ -291,6 +291,9 @@ class SemanticNavigationClient:
         self.main_commands = deque()
 
         self.door_transitions_stored = 0
+        # when we start, we will start with RC SNP and we can assume that transition has happened - namely
+        # from NOT_CLASSIFIED to whatever we are going to classify first.
+        self.transition_likely_happened = True
 
     def reset_seen_objs(self):
         self.objs_in_current_room = set()
@@ -360,6 +363,7 @@ class SemanticNavigationClient:
 
         # find out what room it is based on the items
         room_detection = self.item_infos_to_roomtype(item_infos)
+        #print("RD: ", room_detection, " self.room_detections_last10: ", self.room_detections_last10)
 
         # This is how we will store transfers between rooms:
         #  1) Store 10 images in a buffer at all times.
@@ -370,6 +374,7 @@ class SemanticNavigationClient:
         # Now we will try to ID the room type
         # collect last 10 images
         room_type = room_detection['room_type']
+        #print("RT: ", room_type)
         if room_type != None and room_type != room_type.NOT_KNOWN and room_type != room_type.NOT_CLASSIFIED:
             #print("detected RT: ", room_type, objs_in_image)
             # keep last 10 IDs that were successfully identified
@@ -385,7 +390,7 @@ class SemanticNavigationClient:
 
             self.room_type_id_last10 = [rd['room_type'] for rd in self.room_detections_last10]
 
-            #print("AE: RT: ", self.room_type_id_last10)
+            print("AE: RT: ", self.room_type_id_last10)
 
             # Here we evaluate room type clusters
             if len(self.room_type_id_last10) >= 10:
@@ -688,20 +693,27 @@ class SemanticNavigationClient:
         if len(unknown_door_bboxes) > 0:
             for bbox in unknown_door_bboxes:
 
-                if not self.is_this_door_known(pil_image, bbox, source_snp="PER"):
-                    print("AE: PER interrupting: unknown bbox: ", bbox)
-                    self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
-                    break
-
-                # door_is_near, occupancy, door_is_centered, metrics = self.check_door_proximity(bbox)
-                # if door_is_near and door_is_centered:
-                #     print("AE: PER interrupting: ", metrics)
+                # if not self.is_this_door_known(pil_image, bbox, source_snp="PER"):
+                #     print("AE: PER interrupting: unknown bbox: ", bbox)
                 #     self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
                 #     break
-                # else:
-                #     # TODO: Should we center the agent to face the door if the only problem was centering
-                #     #  and launch DR SNP anyway?
-                #     print("AE: per not reset, unknown door not qualified: ", metrics)
+
+                door_is_near, occupancy, door_is_centered, metrics = self.check_door_proximity(bbox)
+                if (door_is_near
+                        and not(self.is_room_nonsense(self.current_room_type)) # if we don't know what room we're in, then we must either relax classification criterion in self.is_this_door_known(...) or not classify here for known door
+                        and door_is_centered
+                        and not(self.is_this_door_known(pil_image, bbox, source_snp="PER"))):
+                    print("AE: PER interrupting: ", metrics)
+                    # TODO: Here we should only store the exact door from the pil_image and bbox and not selected and tracked ones
+                    door_pic = self.crop_bbox_from_pil(pil_image, bbox)
+                    self.store_door_images_of_transition([(door_pic, bbox)], self.current_room_type,
+                                                         RoomType.NOT_CLASSIFIED, source_snp="PER")
+                    self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                    break
+                else:
+                    # TODO: Should we center the agent to face the door if the only problem was centering
+                    #  and launch DR SNP anyway?
+                    print("AE: per not reset, unknown door not qualified: ", metrics, " self.current_room_type: ", self.current_room_type)
 
     def update_room_detections_after_instability(self, instability_info):
         if instability_info is None or len(instability_info) <= 0: return
@@ -803,6 +815,10 @@ class SemanticNavigationClient:
 
         # group the self.doors_in_current_transition_run items by track_id
         analysis_report, target_tracks, self.door_pics, self.whole_transition_pics, self.bboxes, self.transition_likely_happened = self.analyze_door_trajectories(doors_infos)
+        # If we think we walked into a new room, then reset room classifications so that we start detecting the new
+        # room type from clean state
+        if self.transition_likely_happened:
+            self.reset_last_room_type_identifations()
 
         self.store_tracked_pics_for_debug(target_tracks)
 
@@ -834,8 +850,8 @@ class SemanticNavigationClient:
             # Now that we've stored transition to a new room, let's also store the looks of the door that brought us
             # here. Store door pics to vector DB pertaining to this transition.
             if len(self.door_pics) > 0:
-                self.store_door_images_of_transition(list(zip(self.door_pics, self.bboxes)), RoomType.NOT_CLASSIFIED,
-                                                     self.current_room_type, source_snp="PER")
+                self.store_door_images_of_transition(list(zip(self.door_pics, self.bboxes)), self.current_room_type,
+                                                     RoomType.NOT_CLASSIFIED, source_snp="PER")
             else:
                 print("AE: PER door storage triggered, but no door pictures available: ",
                       [item['track_id'] for item in self.doors_in_current_transition_run.values()])
@@ -959,6 +975,7 @@ class SemanticNavigationClient:
                 self.reset_seen_objs()
                 self.reset_doors_in_current_transition_run()
                 self.reset_door_transition_pics()
+                self.reset_last_room_type_identifations()
         else:
             # We want to manage objects seen in the previous room
             # If previous room is defined, then reset objects seen in that room because we will store new objects
@@ -981,6 +998,7 @@ class SemanticNavigationClient:
                 self.reset_seen_objs()
                 self.reset_doors_in_current_transition_run()
                 self.reset_door_transition_pics()
+                self.reset_last_room_type_identifations()
 
     def go_to_room_centre(self):
         """
@@ -1087,7 +1105,7 @@ class SemanticNavigationClient:
         ## debug - Keeping your exact diagnostic loop working smoothly
         path_id = room_from.name + "_to_" + room_to.name + "_" + str(self.door_transitions_stored) + "_DOORPICS"
         os.makedirs(path_id, exist_ok=True)
-        print(f"STORING {len(serialized_pics)} door pics. shapes: ", [item['shape'] for item in data['door_pics']])
+        print(f"STORING {len(serialized_pics)} door pics. shapes: ", [item['shape'] for item in data['door_pics']], " source_snp: ", source_snp)
 
         for cnt, item in enumerate(door_pics_infos_to_store, 1):
             img_np = np.array(item[0])
@@ -1292,6 +1310,7 @@ class SemanticNavigationClient:
         # Wait for response (this BLOCKS until Jetson replies)
         try:
             response = self.llm_socket.recv_pyobj()
+            #print("AE: RD rsp: ", obj_set, " == ", response)
             return response
         except zmq.ZMQError as e:
             print(f"Error receiving response: {e}")
