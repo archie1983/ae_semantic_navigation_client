@@ -390,7 +390,7 @@ class SemanticNavigationClient:
 
             self.room_type_id_last10 = [rd['room_type'] for rd in self.room_detections_last10]
 
-            print("AE: RT: ", self.room_type_id_last10)
+            #print("AE: RT: ", self.room_type_id_last10)
 
             # Here we evaluate room type clusters
             if len(self.room_type_id_last10) >= 10:
@@ -675,6 +675,9 @@ class SemanticNavigationClient:
         # let's try to ID the room.
         item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted, known_door_bboxes, unknown_door_bboxes = self.process_incoming_image(pil_image)
 
+        # TODO: Implement loop detection - if we've seen some scene before and it keeps repeating very similarly, then
+        #  we've done a perimeter and need to stop it and do DOOR SNP, even if PER SNP hasn't explicitly stopped yet.
+
         if room_transition_spotted:
             #print("TRANS PER: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
             print("TRANS PER: ", self.prev_room_type, self.current_room_type)
@@ -704,7 +707,7 @@ class SemanticNavigationClient:
                         and door_is_centered
                         and not(self.is_this_door_known(pil_image, bbox, source_snp="PER"))):
                     print("AE: PER interrupting: ", metrics)
-                    # TODO: Here we should only store the exact door from the pil_image and bbox and not selected and tracked ones
+                    # TODO: Consider if we want to store door images or general look of the place.
                     door_pic = self.crop_bbox_from_pil(pil_image, bbox)
                     self.store_door_images_of_transition([(door_pic, bbox)], self.current_room_type,
                                                          RoomType.NOT_CLASSIFIED, source_snp="PER")
@@ -713,7 +716,8 @@ class SemanticNavigationClient:
                 else:
                     # TODO: Should we center the agent to face the door if the only problem was centering
                     #  and launch DR SNP anyway?
-                    print("AE: per not reset, unknown door not qualified: ", metrics, " self.current_room_type: ", self.current_room_type)
+                    #print("AE: per not reset, unknown door not qualified: ", metrics, " self.current_room_type: ", self.current_room_type)
+                    pass
 
     def update_room_detections_after_instability(self, instability_info):
         if instability_info is None or len(instability_info) <= 0: return
@@ -822,6 +826,9 @@ class SemanticNavigationClient:
 
         self.store_tracked_pics_for_debug(target_tracks)
 
+    ## TODO: Use PER SN as the main one. If it sees door that has already been explored, then continue. If it sees a
+    #   door that hasn't been explored, use DR SNP.
+
     def store_door_pics_and_fpvs_after_perimeter_SNP(self):
         """
         So the perimeter walker SNP has finished and we probably stopped because we saw a door that needs investigation.
@@ -841,6 +848,7 @@ class SemanticNavigationClient:
         #self.store_tracked_pics_for_debug(target_tracks)
 
         if len(self.whole_transition_pics) > 0:
+            # TODO: decide if we want to store door pics only or whole FPV.
             # this might be a case of walking through an open plan living room into a kitchen (in which case we won't
             # have a door, or this might be a transition through a door. Regardless of doors, if we have changed a room
             # type, then we store the transition
