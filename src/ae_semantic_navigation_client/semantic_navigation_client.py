@@ -773,6 +773,12 @@ class SemanticNavigationClient:
                         print("AE: PER interrupting to explore a new door: ", metrics)
                         self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
                         break
+                else:
+                    # Here we should probably clear the self.prev_anchor_id so that we can start looking at it again
+                    self.prev_anchor_id = -1
+        else:
+            # Here we should probably clear the self.prev_anchor_id so that we can start looking at it again
+            self.prev_anchor_id = -1
 
     def store_last_x_steps_anchor_view(self, current_room):
         """
