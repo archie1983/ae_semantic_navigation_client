@@ -278,6 +278,7 @@ class SemanticNavigationClient:
         self.reset_last_room_type_identifations()
         self.reset_doors_in_current_transition_run()
         self.reset_door_transition_pics()
+        self.reset_anchor_ids()
 
         self.common_objs = {'OPENDOOR', 'CLOSEDDOOR', 'FLOOR'}
         self.current_room_type = RoomType.NOT_KNOWN
@@ -291,6 +292,7 @@ class SemanticNavigationClient:
         self.main_commands = deque()
 
         self.door_transitions_stored = 0
+        self.anchor_points_stored = 0
         # when we start, we will start with RC SNP and we can assume that transition has happened - namely
         # from NOT_CLASSIFIED to whatever we are going to classify first.
         self.transition_likely_happened = True
@@ -303,6 +305,27 @@ class SemanticNavigationClient:
 
     def reset_last_pics(self):
         self.fpv_images_last_x = []
+
+    def reset_anchor_ids(self):
+        # TODO: Do we want a hierarchical structure here (perhaps a tree?) to store anchor IDs of nested rooms? Then
+        #  we would only want to reset leaves here and continue with the higher up room's anchors.
+        self.anchor_ids = dict()
+        self.prev_anchor_id = None
+
+    def register_anchor_id(self, anchor_id):
+        """
+        If we've spotted an anchor point in PER SNP, then register it here by counting how many times we've seen it
+        :return:
+        """
+        # we want to avoid a situation where the same anchor view is being triggered repeatedly by just walking
+        # toward some door. If the same ID was triggered as last time, then ignore and don't increase the incidence.
+        if self.prev_anchor_id == anchor_id: return
+
+        if anchor_id in self.anchor_ids.keys():
+            self.anchor_ids[anchor_id] += 1
+        else:
+            self.anchor_ids[anchor_id] = 1
+        self.prev_anchor_id = anchor_id
 
     def reset_door_transition_pics(self):
         self.door_pics = []
@@ -689,35 +712,157 @@ class SemanticNavigationClient:
         #     self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
 
 
-        # if there is an unknown door, then let's explore it. We should attempt to walk through it, but will door SNP
-        # alone do it? At least we should center it into our FPV and perhaps then switch on DR SNP. Let's do that
-        # when the door is sufficiently close and more or less centered within the screen, then we want to interrupt
-        # this perimeter finder SNP and let the system continue with door finder SNP.
-        if len(unknown_door_bboxes) > 0:
-            for bbox in unknown_door_bboxes:
+        # # if there is an unknown door, then let's explore it. We should attempt to walk through it, but will door SNP
+        # # alone do it? At least we should center it into our FPV and perhaps then switch on DR SNP. Let's do that
+        # # when the door is sufficiently close and more or less centered within the screen, then we want to interrupt
+        # # this perimeter finder SNP and let the system continue with door finder SNP.
+        # if len(unknown_door_bboxes) > 0:
+        #     for bbox in unknown_door_bboxes:
+        #         door_is_near, occupancy, door_is_centered, metrics = self.check_door_proximity(bbox)
+        #         # if not self.is_this_door_known(pil_image, bbox, source_snp="PER"):
+        #         #     print("AE: PER interrupting: unknown bbox: ", bbox)
+        #         #     self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+        #         #     break
+        #         # TODO: Count how many similar (at some threshold, maybe ~80%) detections of a door we have. If we have only a few,
+        #         #  then treat it as unexplored door, otherwise as an explored one. Also, develop logic for when we decide that
+        #         #  a room has been explored (no more new doors). Perhaps using a tree structure to store embeddings?
+        #         if (door_is_near
+        #                 and not(self.is_room_nonsense(self.current_room_type)) # if we don't know what room we're in, then we must either relax classification criterion in self.is_this_door_known(...) or not classify here for known door
+        #                 and door_is_centered
+        #                 and not(self.is_this_door_known(pil_image, bbox, source_snp="PER"))):
+        #             print("AE: PER interrupting: ", metrics)
+        #             # TODO: Consider if we want to store door images or general look of the place.
+        #             door_pic = self.crop_bbox_from_pil(pil_image, bbox)
+        #             self.store_door_images_of_transition([(door_pic, bbox)], self.current_room_type,
+        #                                                  RoomType.NOT_CLASSIFIED, source_snp="PER")
+        #             self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+        #             break
+        #         else:
+        #             # TODO: Should we center the agent to face the door if the only problem was centering
+        #             #  and launch DR SNP anyway?
+        #             #print("AE: per not reset, unknown door not qualified: ", metrics, " self.current_room_type: ", self.current_room_type)
+        #             pass
 
-                # if not self.is_this_door_known(pil_image, bbox, source_snp="PER"):
-                #     print("AE: PER interrupting: unknown bbox: ", bbox)
-                #     self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
-                #     break
+        all_door_bboxes = unknown_door_bboxes.copy()
+        all_door_bboxes.extend(known_door_bboxes)
 
+        if len(all_door_bboxes) > 0:
+            for bbox in all_door_bboxes:
                 door_is_near, occupancy, door_is_centered, metrics = self.check_door_proximity(bbox)
                 if (door_is_near
-                        and not(self.is_room_nonsense(self.current_room_type)) # if we don't know what room we're in, then we must either relax classification criterion in self.is_this_door_known(...) or not classify here for known door
-                        and door_is_centered
-                        and not(self.is_this_door_known(pil_image, bbox, source_snp="PER"))):
-                    print("AE: PER interrupting: ", metrics)
-                    # TODO: Consider if we want to store door images or general look of the place.
-                    door_pic = self.crop_bbox_from_pil(pil_image, bbox)
-                    self.store_door_images_of_transition([(door_pic, bbox)], self.current_room_type,
-                                                         RoomType.NOT_CLASSIFIED, source_snp="PER")
-                    self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
-                    break
-                else:
-                    # TODO: Should we center the agent to face the door if the only problem was centering
-                    #  and launch DR SNP anyway?
-                    #print("AE: per not reset, unknown door not qualified: ", metrics, " self.current_room_type: ", self.current_room_type)
-                    pass
+                        and not (self.is_room_nonsense(
+                            self.current_room_type))  # if we don't know what room we're in, then we must either relax classification criterion in self.is_this_door_known(...) or not classify here for known door
+                        and door_is_centered):
+
+                    is_door_anchored, anchor_id = self.are_last_x_steps_anchored()
+                    if is_door_anchored:
+                        # if the door is good, but the view IS anchored, then we have detected a loop and want to break it -
+                        # either now or after another occurence in which case we'll need the record ID from Vector DB.
+                        self.register_anchor_id(anchor_id)
+                        if self.anchor_ids[anchor_id] > 3:
+                            print("AE: PER interrupting because a loop was detected: ", metrics)
+                            self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                            break
+                        # TODO: we want to go out through the same door that we went in. For that we'll need to keep track
+                        #  what room it was (during DOOR SNP) and query here the door pic to know if we're looking at the
+                        #  right door.
+                        pass
+                    else:
+                        # if we have a good door in view and the last few steps are not anchored, then remember this anchor
+                        self.store_last_x_steps_anchor_view(self.current_room_type)
+                        print("AE: PER interrupting to explore a new door: ", metrics)
+                        self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                        break
+
+    def store_last_x_steps_anchor_view(self, current_room):
+        """
+        Collect last x images (perhaps 5 or 10 might be sufficient) and send them to server to embed and average and
+        store as an anchor point
+
+        Args:
+
+        :param path_imgs:
+        :return:
+        """
+
+        if len(self.fpv_images_last_x) > 5 and not self.DEBUG:#self.IMGS_TO_EMBED:
+            anchor_imgs = self.fpv_images_last_x[-5:]  # get last images -- self.IMGS_TO_EMBED
+            anchor_imgs = np.stack(anchor_imgs)
+        else:
+            return None
+
+        # Serialize the images
+        data = {
+            'shape': anchor_imgs.shape,
+            'dtype': str(anchor_imgs.dtype),
+            'bytes': anchor_imgs.tobytes(),
+            'action': "store_anchor_point",
+            'current_room': current_room.name,
+            'module': "path_comparator"
+        }
+
+        ## debug
+        self.anchor_points_stored += 1
+        path_id = "ANCHOR_" + str(self.door_transitions_stored)
+        os.makedirs(path_id, exist_ok=True)
+        cnt = 0
+        #print("STORING ", len(path_imgs), " images. early_or_late = ", early_or_late)
+        for img in anchor_imgs:
+            cnt += 1
+            cv2.imwrite(os.path.join(path_id, str(cnt) + ".png"), img)
+        ## /debug
+
+        # Send request
+        self.llm_socket.send_pyobj(data)
+
+        # Wait for response (this BLOCKS until Jetson replies)
+        try:
+            response = self.llm_socket.recv_pyobj()
+            return response
+        except zmq.ZMQError as e:
+            print(f"Error receiving response: {e}")
+            return None
+
+    def are_last_x_steps_anchored(self):
+        """
+        Collect last x number of FPV images and check whether they comprise a previously stored anchor
+        :return:
+        """
+
+        if len(self.fpv_images_last_x) > 5 and not self.DEBUG:#self.IMGS_TO_EMBED:
+            anchor_imgs = self.fpv_images_last_x[-5:]  # get last images -- self.IMGS_TO_EMBED
+            anchor_imgs = np.stack(anchor_imgs)
+        else:
+            return False, -1
+
+        # Serialize the images
+        data = {
+            'shape': anchor_imgs.shape,
+            'dtype': str(anchor_imgs.dtype),
+            'bytes': anchor_imgs.tobytes(),
+            'action': "qry_anchor_point",
+            'module': "path_comparator"
+        }
+
+        # Send request
+        self.llm_socket.send_pyobj(data)
+
+        # Wait for response (this BLOCKS until Jetson replies)
+        try:
+            response = self.llm_socket.recv_pyobj()
+        except zmq.ZMQError as e:
+            print(f"Error receiving response: {e}")
+            response = None
+
+        if (response and (response['qry_results'] and
+                len(response['qry_results']) > 0 and
+                response['qry_results'][0]['similarity'] > 0.8)):
+            #and (stored_door_info['qry_results'][0]['room_from'] == self.current_room_type.name)):
+            return True, response['qry_results'][0]['id']
+        else:
+            if response and response['qry_results'] and len(response['qry_results']) > 0:
+                print("AE: Anchor Point Info: ", response['qry_results'][0]['similarity'], ' anchor_id: ', response['qry_results'][0]['id'], ' rt: ', response['qry_results'][0]['current_room'], ' # cur: ', self.current_room_type.name)
+            return False, -1
 
     def update_room_detections_after_instability(self, instability_info):
         if instability_info is None or len(instability_info) <= 0: return
@@ -792,7 +937,7 @@ class SemanticNavigationClient:
              ) for item in doors_in_current_transition_run_flat]
 
         if debug:
-            print("AE: self.doors_in_current_transition_run : ", [(info_item[0], info_item[1]) for info_item in doors_infos])
+            #print("AE: self.doors_in_current_transition_run : ", [(info_item[0], info_item[1]) for info_item in doors_infos])
 
             path_id = "debug_door_pics"
             os.makedirs(path_id, exist_ok=True)
@@ -867,6 +1012,7 @@ class SemanticNavigationClient:
             self.reset_seen_objs()
             self.reset_doors_in_current_transition_run()
             self.reset_door_transition_pics()
+            self.reset_anchor_ids()
 
     def store_tracked_pics_for_debug(self, target_tracks):
         path_id = "debug_chosen_door_pics"
@@ -943,10 +1089,10 @@ class SemanticNavigationClient:
             # 4) take one with most frames
             target_tracks.append((track_id, frame_count, max_ratio))
 
-        for tid in sorted(analysis_report.keys(), key=lambda x: str(x)):
-            stats = analysis_report[tid]
-            print(
-                f"Track ID {tid} | Frames: {stats['frame_count']:2d} | Peak Occupancy: {stats['max_occupancy']:.2f} | Trend: {stats['trend']:+.2f}")
+        # for tid in sorted(analysis_report.keys(), key=lambda x: str(x)):
+        #     stats = analysis_report[tid]
+        #     print(
+        #         f"Track ID {tid} | Frames: {stats['frame_count']:2d} | Peak Occupancy: {stats['max_occupancy']:.2f} | Trend: {stats['trend']:+.2f}")
 
         target_tracks = target_tracks[-10:] # take last 10
         target_tracks = [item for item in target_tracks if item[2] > 0.85]  # enforce peak occupancy
@@ -1400,11 +1546,11 @@ if __name__ == "__main__":
     #                                                      np.stack([agent.rc_action_gen.last_image_large], axis=0)))
 
     agent.reset_seen_objs()
-    rooms_to_traverse = 7
+    rooms_to_traverse = 10
     #agent.add_main_command(agent.go_to_room_centre)
     for i in range(rooms_to_traverse):
-        agent.add_main_command(agent.go_to_room_centre)
-        agent.do_random_rotation()
+        #agent.add_main_command(agent.go_to_room_centre)
+        #agent.do_random_rotation()
         agent.add_main_command(agent.go_to_perimeter_of_room)
         #agent.do_random_rotation()
         agent.add_main_command(agent.go_to_next_room)
