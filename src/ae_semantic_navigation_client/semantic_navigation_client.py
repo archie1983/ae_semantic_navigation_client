@@ -283,6 +283,13 @@ class SemanticNavigationClient:
         self.common_objs = {'OPENDOOR', 'CLOSEDDOOR', 'FLOOR'}
         self.current_room_type = RoomType.NOT_KNOWN
         self.prev_room_type = RoomType.NOT_KNOWN
+        # We will want to keep the last room type detected during DR SNP so that we know what room we came from
+        # immediately when we start the new SNP (PER or RC) - regardless if we have processed a room transition yet
+        # (detected a new room type) or not. We can't rely on self.current_room_type or self.prev_room_type because they
+        # are one set at the very end of DR SNP and change to a potentially new set a few steps after the new SNP has
+        # started, but we don't know at what point we will need to query door pics and determine whether it leads back
+        # to the previous room or not.
+        self.last_dr_SNP_confirmed_room = RoomType.NOT_KNOWN
         self.objects_by_room = dict()
         self.doors_in_current_room = []
 
@@ -427,6 +434,8 @@ class SemanticNavigationClient:
                     # Trigger your embedding storage and transition mechanics here
                     self.prev_room_type = self.current_room_type
                     self.current_room_type = most_common_room
+                    if self.last_dr_SNP_confirmed_room == RoomType.NOT_KNOWN:
+                        self.last_dr_SNP_confirmed_room = self.current_room_type
                     room_transition_spotted = True
                 # else:
                 #     print("AE: most_common_room: ", most_common_room, " count: ", count)
@@ -752,21 +761,55 @@ class SemanticNavigationClient:
                 if (door_is_near
                         and not (self.is_room_nonsense(
                             self.current_room_type))  # if we don't know what room we're in, then we must either relax classification criterion in self.is_this_door_known(...) or not classify here for known door
-                        and door_is_centered):
+                ):#and door_is_centered):
 
                     is_door_anchored, anchor_id = self.are_last_x_steps_anchored()
                     if is_door_anchored:
                         # if the door is good, but the view IS anchored, then we have detected a loop and want to break it -
                         # either now or after another occurence in which case we'll need the record ID from Vector DB.
                         self.register_anchor_id(anchor_id)
-                        if self.anchor_ids[anchor_id] > 3:
-                            print("AE: PER interrupting because a loop was detected: ", metrics)
-                            self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
-                            break
-                        # TODO: we want to go out through the same door that we went in. For that we'll need to keep track
-                        #  what room it was (during DOOR SNP) and query here the door pic to know if we're looking at the
-                        #  right door.
-                        pass
+                        print("ANCHOR ID: ", anchor_id, " len: ", self.anchor_ids[anchor_id])
+                        if self.anchor_ids[anchor_id] > 1:
+                            print("AE: PER a loop was detected: ", metrics)
+                            # self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                            # break
+                            # TODO: we want to go out through the same door that we went in. For that we'll need to keep track
+                            #  what room it was (during DOOR SNP) and query here the door pic to know if we're looking at the
+                            #  right door. We can do that by querying already collected DR SNP transitions and comparing what
+                            #  room they're leading to with what room we came from.
+                            #
+                            #  self.last_dr_SNP_confirmed_room contains strictly the last room type that we had while doing
+                            #  DOOR SNP and it is not necessarily self.prev_room_type because self.prev_room_type might
+                            #  still not be set at this point where we are already running PER SNP (room transition may not
+                            #  yet have been processed).
+                            qry_result = self.qry_door_transition(np.stack([pil_image]))
+
+                            if qry_result and qry_result['success'] and len(qry_result['qry_results']) > 0:
+                                best_match = qry_result['qry_results'][0]
+                                if best_match['similarity'] >= 0.80:
+                                    # The image we're looking at is a gateway to some room. If it is the same as
+                                    # self.last_dr_SNP_confirmed_room then we can assume that we're returning to the room we came from.
+                                    if best_match['room_to'] == self.last_dr_SNP_confirmed_room.name:
+                                        print("AE: PER interrupting to go back to where we came from")
+                                        self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                                        break
+                                    else:
+                                        print("AE: Didn't qualify for the door leading back: conf = ", best_match['similarity'], " room in DB: ", best_match['room_to'], " cur room: ", self.last_dr_SNP_confirmed_room.name)
+                                        # so it wasn't a door leading back, but loop nonetheless. What should we do? Interrupt?
+                                        # Perhaps let's interrupt if we've seen it third time already
+                                        if self.anchor_ids[anchor_id] > 2:
+                                            self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                                            print("Interrupting because self.anchor_ids[anchor_id] = ", self.anchor_ids[anchor_id])
+                                            break
+                                else:
+                                    print("AE: Didn't match known door: conf = ", best_match['similarity'],
+                                          " room in DB: ", best_match['room_to'], " cur room: ",
+                                          self.last_dr_SNP_confirmed_room.name)
+                                    # So not really a door that we know, but it was still a loop
+                                    if self.anchor_ids[anchor_id] > 2:
+                                        self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                                        print("Interrupting because self.anchor_ids[anchor_id] = ", self.anchor_ids[anchor_id])
+                                        break
                     else:
                         # if we have a good door in view and the last few steps are not anchored, then remember this anchor
                         self.store_last_x_steps_anchor_view(self.current_room_type)
@@ -775,6 +818,7 @@ class SemanticNavigationClient:
                         break
                 else:
                     # Here we should probably clear the self.prev_anchor_id so that we can start looking at it again
+                    print("DOOR PROX NOQUAL: ", door_is_near, occupancy, door_is_centered, metrics, self.current_room_type)
                     self.prev_anchor_id = -1
         else:
             # Here we should probably clear the self.prev_anchor_id so that we can start looking at it again
@@ -973,6 +1017,7 @@ class SemanticNavigationClient:
         # If we think we walked into a new room, then reset room classifications so that we start detecting the new
         # room type from clean state
         if self.transition_likely_happened:
+            self.last_dr_SNP_confirmed_room = self.current_room_type
             self.reset_last_room_type_identifations()
 
         self.store_tracked_pics_for_debug(target_tracks)
