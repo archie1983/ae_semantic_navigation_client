@@ -129,6 +129,11 @@ class SceneNavigator:
 
             if next_move_str == "STOP":
                 continue
+            elif next_move_str == "PAUSE":
+                for i in range(4):
+                    self.rnc.execute_action("RotateRight", degrees=45, moveMagnitude=self.grid_size,
+                                            grid_size=self.grid_size,
+                                            adhere_to_grid=True)
             else:
                 self.rnc.execute_action(next_move_str, degrees=45, moveMagnitude=self.grid_size, grid_size=self.grid_size,
                                         adhere_to_grid=True)

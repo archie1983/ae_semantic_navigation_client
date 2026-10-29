@@ -126,10 +126,9 @@ class ActionGenerator:
                 interpolation=cv2.INTER_LANCZOS4  # High quality
             )
 
-            # if we have a bbox to cover and we've already ran for at least 10 steps, then reset
+            # if we have a bbox to cover and we've already ran for at least 10 steps, then reset SNP (not interrupt)
             if self.steps_after_reset >= 10:
                 self.reset()
-
         else:
             # Resize to 64 x 64
             img_64x64 = cv2.resize(
@@ -137,6 +136,14 @@ class ActionGenerator:
                 (64, 64),
                 interpolation=cv2.INTER_LANCZOS4  # High quality
             )
+
+        # # Don't paint over the door anymore, we'll ignore the command instead
+        # # Resize to 64 x 64
+        # img_64x64 = cv2.resize(
+        #     ai2_thor_image,
+        #     (64, 64),
+        #     interpolation=cv2.INTER_LANCZOS4  # High quality
+        # )
 
         rgb_img_64x64 = cv2.cvtColor(img_64x64, cv2.COLOR_BGR2RGB)
         pil_image_64x64 = Image.fromarray(rgb_img_64x64)
@@ -172,7 +179,13 @@ class ActionGenerator:
             print(f"Error receiving response: {e}")
             response = None
 
-        next_move_str = index_to_action(response['action_bits']['action']) # <- this needs to talk to Jetson over ZMQ and pass it the image
+        # # Instead of painting over the doors and resetting, let's just ignore the command
+        # if bboxes_to_cover is not None and len(bboxes_to_cover) > 0:
+        #     next_move_str = "PAUSE"
+        #     self.reset()
+        # else:
+        #     next_move_str = index_to_action(response['action_bits']['action']) # <- this needs to talk to Jetson over ZMQ and pass it the image
+        next_move_str = index_to_action(response['action_bits']['action'])  # <- this needs to talk to Jetson over ZMQ and pass it the image
         #print("ACT: ", next_move_str)
         # along with the rest of the observation.
         # next_move_str has to be returned from Dreamer running on Jetson and then if it is STOP, then we need to prepare
@@ -291,7 +304,7 @@ class SemanticNavigationClient:
         # to the previous room or not.
         self.last_dr_SNP_confirmed_room = RoomType.NOT_KNOWN
         self.objects_by_room = dict()
-        self.doors_in_current_room = []
+        self.doors_in_current_room = dict()
 
         self.current_active_SNP = SNPType.NONE
         # A queue to hold pending remedy functions
@@ -342,6 +355,9 @@ class SemanticNavigationClient:
 
     def reset_doors_in_current_transition_run(self):
         self.doors_in_current_transition_run = dict()
+
+    def prepare_for_PER_SNP(self):
+        self.doors_in_current_room = dict()
 
     def add_door_in_current_transition_run(self, track_id, bbox, door_pic, whole_pic = None):
         """
@@ -487,14 +503,13 @@ class SemanticNavigationClient:
         # Doors are important objects. If we have just spotted one, then we want to know if we have seen this door
         # before and whether we want to paint over it to force DR SNP to ignore it and look for another door or whether
         # we want to explore it.
-        known_door_bboxes = []
-        unknown_door_bboxes = []
+        doors_info = []
         if 'OPENDOOR' in objs_in_image and not self.DEBUG:
-            known_door_bboxes, unknown_door_bboxes = self.recognize_doors_in_single_image(pil_image, item_infos)
+            doors_info = self.recognize_doors_in_single_image(pil_image, item_infos)
 
-        return item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted, known_door_bboxes, unknown_door_bboxes
+        return item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted, doors_info
 
-    def check_door_proximity(self, bbox, frame_width=600, frame_height=600, centering_threshold=0.30, proximity_threshold=0.60):
+    def check_door_proximity(self, bbox, frame_width=600, frame_height=600, centering_threshold=0.30, proximity_threshold=0.30):
         """
         Checks if a door is close enough to confidently identify/block,
         using a normalized vertical scale factor to bypass width variations.
@@ -540,7 +555,7 @@ class SemanticNavigationClient:
         door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
         # If we've spotted an OPENDOOR, then let's query if this door has been seen from other
         # angles and distances.
-        stored_door_info = self.qry_door_images_of_transition(door_only_pic, source_snp)
+        stored_door_info = self.qry_door_pics_of_transition(door_only_pic, source_snp)
 
         if ((stored_door_info['qry_results'] and
                 len(stored_door_info['qry_results']) > 0 and
@@ -577,10 +592,14 @@ class SemanticNavigationClient:
         :return:
         '''
         # let's try to ID the room.
-        item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted, known_door_bboxes, unknown_door_bboxes = self.process_incoming_image(pil_image)
+        item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted, doors_info = self.process_incoming_image(pil_image)
 
-        bboxes_to_cover = known_door_bboxes
-        bboxes_to_cover = None # for now disable this
+        # TODO: How about instead of painting the doors, we just don't execute an action? - TRIED, doesn't move at all.
+        bboxes_to_cover = [di['bbox'] for di in doors_info if di['door_known']]
+
+        # If we have only one door in this room, then don't cover any bboxes
+        if len(self.doors_in_current_room.keys()) < 2:
+            bboxes_to_cover = None
 
         # If we have at least five doors in the recent history, then start querying if we know anything about them
         # because we could be near a transit to another room.
@@ -620,29 +639,33 @@ class SemanticNavigationClient:
                 # then we may want to paint over it.
                 door_analysis = self.analyze_door(pil_image, bbox)
                 doors_info.append(door_analysis)
-                self.collect_door_in_this_room(door_analysis['door_info'])
+                # door_analysis['door_info'] contains ID, room_from, room_to and similarity
+                # door_analysis itself also contains door_known and bbox
 
-        known_door_bboxes = [di['bbox'] for di in doors_info if di['door_known']]
-        unknown_door_bboxes = [di['bbox'] for di in doors_info if not di['door_known']]
-
-        return known_door_bboxes, unknown_door_bboxes
+        #return known_door_bboxes, unknown_door_bboxes
+        return doors_info
 
     def collect_door_in_this_room(self, new_door_info):
         # Add the detected door to the doors of the current room. If such door already exists, then we know
         # about this door already, if not, then we should explore it.
-        room_from = new_door_info['room_from']
-        room_to = new_door_info['room_to']
-        sim = new_door_info['similarity']
-        for door in self.doors_in_current_room:
-            if door['room_from'] == room_from and door['room_to'] == room_to:
-                return
-        self.doors_in_current_room.append(new_door_info)
+
+        # new_door_info['door_info'] contains ID, room_from, room_to and similarity
+        # new_door_info itself also contains door_known and bbox
+        door_actual_info = new_door_info['door_info']
+        bbox = new_door_info['bbox']
+        door_known = new_door_info['door_known']
+        room_from = door_actual_info['room_from']
+        room_to = door_actual_info['room_to']
+        sim = door_actual_info['similarity']
+        id = door_actual_info['id']
+
+        self.doors_in_current_room[id] = {'room_from': room_from, 'room_to': room_to}
 
     def analyze_door(self, pil_image, bbox):
         door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
         # If we've spotted an OPENDOOR, then let's query if this door has been seen from other
         # angles and distances.
-        stored_door_info = self.qry_door_images_of_transition(door_only_pic)
+        stored_door_info = self.qry_door_pics_of_transition(door_only_pic)
         door_info = dict()
         door_known = False
 
@@ -650,12 +673,14 @@ class SemanticNavigationClient:
              len(stored_door_info['qry_results']) > 0 and
              stored_door_info['qry_results'][0]['similarity'] > 0.8)
                 and (stored_door_info['qry_results'][0]['room_from'] == self.current_room_type.name)):
-            door_info = {'room_from': stored_door_info['qry_results'][0]['room_from'],
+            door_info = {'id': stored_door_info['qry_results'][0]['id'],
+                               'room_from': stored_door_info['qry_results'][0]['room_from'],
                                'room_to': stored_door_info['qry_results'][0]['room_to'],
                                'similarity': stored_door_info['qry_results'][0]['similarity']}
             door_known = True
         else:
-            door_info = {'room_from': self.current_room_type.name,
+            door_info = {'id': -1,
+                         'room_from': self.current_room_type.name,
                          'room_to': 'NOT_KNOWN',
                          'similarity': -1.0}
             door_known = False
@@ -690,7 +715,7 @@ class SemanticNavigationClient:
         :return:
         '''
         # let's try to ID the room.
-        item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted, known_door_bboxes, unknown_door_bboxes = self.process_incoming_image(pil_image)
+        item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted, doors_info = self.process_incoming_image(pil_image)
 
         if room_transition_spotted:
             #print("TRANS RC: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
@@ -705,14 +730,15 @@ class SemanticNavigationClient:
         :return:
         '''
         # let's try to ID the room.
-        item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted, known_door_bboxes, unknown_door_bboxes = self.process_incoming_image(pil_image)
+        item_infos, objs_in_image, instability_info, room_detection, room_transition_spotted, doors_info = self.process_incoming_image(pil_image)
 
         # TODO: Implement loop detection - if we've seen some scene before and it keeps repeating very similarly, then
         #  we've done a perimeter and need to stop it and do DOOR SNP, even if PER SNP hasn't explicitly stopped yet.
 
         if room_transition_spotted:
             #print("TRANS PER: ", self.room_type_id_last10, self.prev_room_type, self.current_room_type)
-            print("TRANS PER: ", self.prev_room_type, self.current_room_type)
+            if (self.prev_room_type != self.current_room_type):
+                print("TRANS PER: ", self.prev_room_type, self.current_room_type)
 
         # Not sure what else we might want to do in the perimeter finder - at least for now while I'm focussing on environment exploration.
 
@@ -752,8 +778,15 @@ class SemanticNavigationClient:
         #             #print("AE: per not reset, unknown door not qualified: ", metrics, " self.current_room_type: ", self.current_room_type)
         #             pass
 
-        all_door_bboxes = unknown_door_bboxes.copy()
-        all_door_bboxes.extend(known_door_bboxes)
+        all_door_bboxes = [di['bbox'] for di in doors_info]
+
+        # doors_info['door_info'] contains ID, room_from, room_to and similarity
+        # doors_info itself also contains door_known and bbox
+        # Here in PER SNP we want to collect info about the doors that we see. Later in DR SNP we might need to use
+        # this data to decide if we want to paint over a specific door or not. For example if we only have
+        # one door in a room, then we may not want to stop the agent going through it even if it already
+        # has explored it.
+        for di in doors_info: self.collect_door_in_this_room(di)
 
         if len(all_door_bboxes) > 0:
             for bbox in all_door_bboxes:
@@ -810,6 +843,14 @@ class SemanticNavigationClient:
                                         self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
                                         print("Interrupting because self.anchor_ids[anchor_id] = ", self.anchor_ids[anchor_id])
                                         break
+                            else:
+                                # Such Image hasn't been embedded at all, but we do have a loop detected on an anchor. We probably
+                                # never switched on DR SNP for this room yet.
+                                if self.anchor_ids[anchor_id] > 2:
+                                    self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
+                                    print("Door unknwon... Interrupting because self.anchor_ids[anchor_id] = ",
+                                          self.anchor_ids[anchor_id])
+                                    break
                     else:
                         # if we have a good door in view and the last few steps are not anchored, then remember this anchor
                         self.store_last_x_steps_anchor_view(self.current_room_type)
@@ -818,7 +859,7 @@ class SemanticNavigationClient:
                         break
                 else:
                     # Here we should probably clear the self.prev_anchor_id so that we can start looking at it again
-                    print("DOOR PROX NOQUAL: ", door_is_near, occupancy, door_is_centered, metrics, self.current_room_type)
+                    #print("DOOR PROX NOQUAL: ", door_is_near, occupancy, door_is_centered, metrics, self.current_room_type)
                     self.prev_anchor_id = -1
         else:
             # Here we should probably clear the self.prev_anchor_id so that we can start looking at it again
@@ -1241,6 +1282,7 @@ class SemanticNavigationClient:
         Use remote DreamerV3 model on Jetson to go through the nearest door and into the next room
         :return:
         """
+        self.prepare_for_PER_SNP()
         self.per_action_gen.set_image_receiver(self.process_incoming_image_per)
         self.scene_navigator.set_action_gen(self.per_action_gen)
         self.current_active_SNP = SNPType.PERIMETER_WALKER
@@ -1330,7 +1372,7 @@ class SemanticNavigationClient:
             print(f"Error receiving response: {e}")
             return None
 
-    def qry_door_images_of_transition(self, door_img, source_snp = "DR"):
+    def qry_door_pics_of_transition(self, door_img, source_snp = "DR"):
         door_img = np.stack([door_img])
 
         # Serialize the images
