@@ -8,6 +8,7 @@ from ae_llm_navigation_decisions import RoomType
 from collections import Counter
 from enum import Enum
 from collections import deque, defaultdict
+from scipy.signal import find_peaks
 
 class ActionGenerator:
     def __init__(self, dreamer_socket):
@@ -30,10 +31,14 @@ class ActionGenerator:
         # might persist, but we don't want to keep sending the reset signals. This variable will help with that.
         self.steps_after_reset = 0
 
+        # Let's keep track of all the actions that we took before reset
+        self.actions_taken = []
+
     def reset(self):
         self._cur_obs["is_first"] = True
         self._cur_obs["is_last"] = False
         self.steps_after_reset = 0
+        self.actions_taken = []
         if self.snp_reset_procedure is not None:
             self.snp_reset_procedure()
 
@@ -186,6 +191,7 @@ class ActionGenerator:
         # else:
         #     next_move_str = index_to_action(response['action_bits']['action']) # <- this needs to talk to Jetson over ZMQ and pass it the image
         next_move_str = index_to_action(response['action_bits']['action'])  # <- this needs to talk to Jetson over ZMQ and pass it the image
+        self.actions_taken.append(next_move_str)
         #print("ACT: ", next_move_str)
         # along with the rest of the observation.
         # next_move_str has to be returned from Dreamer running on Jetson and then if it is STOP, then we need to prepare
@@ -216,6 +222,7 @@ class RandomRotationActionGen(ActionGenerator):
         # how many steps (1 step = 45 degrees)
         step_cnt = random.randint(1, 4)
         self.actions = ['RotateRight' if rotate_direction else 'RotateLeft' for i in range(step_cnt)]
+        self.actions_taken = self.actions
 
     def __call__(self, ai2_thor_image):
         if self.actions:
@@ -277,6 +284,7 @@ class SemanticNavigationClient:
         self.dr_action_gen = ActionGenerator(self.dr_socket)
         self.per_action_gen = ActionGenerator(self.per_socket)
         self.rr_action_gen = RandomRotationActionGen()
+        self.current_active_action_gen = None
         self.scene_navigator = SceneNavigator(self.rc_action_gen)
 
         # load a certain habitat
@@ -305,6 +313,7 @@ class SemanticNavigationClient:
         self.last_dr_SNP_confirmed_room = RoomType.NOT_KNOWN
         self.objects_by_room = dict()
         self.doors_in_current_room = dict()
+        self.reset_observed_door_bboxes()
 
         self.current_active_SNP = SNPType.NONE
         # A queue to hold pending remedy functions
@@ -316,6 +325,9 @@ class SemanticNavigationClient:
         # when we start, we will start with RC SNP and we can assume that transition has happened - namely
         # from NOT_CLASSIFIED to whatever we are going to classify first.
         self.transition_likely_happened = True
+
+    def reset_observed_door_bboxes(self):
+        self.observed_door_bboxes = {'nones': 0, 'door_bboxes': []}
 
     def reset_seen_objs(self):
         self.objs_in_current_room = set()
@@ -358,6 +370,93 @@ class SemanticNavigationClient:
 
     def prepare_for_PER_SNP(self):
         self.doors_in_current_room = dict()
+
+    def detect_passing_through_door(self, new_bboxes):
+        """
+        Analyze sequential door bbox inputs and try to predict a passing through a door.
+        :return:
+        """
+        STEPS_TO_LOOK_AT = 5
+        passover_detected = False
+        if new_bboxes is None:
+            # no door bboxes observed in the image, maybe we entered the new room or maybe we're doing 360 degree turn
+            # before the door or maybe we went further past the door.
+            self.observed_door_bboxes['nones'] += 1
+            if self.observed_door_bboxes['nones'] > 4:
+                print("PASSOVER DETECTION RESET")
+                self.reset_observed_door_bboxes()
+        else:
+            # we have at least one new bbox. Let's see how it tallies with the bboxes that we already have
+            for bbox in new_bboxes:
+                _, _, _, metrics = self.check_door_proximity(bbox)
+                occ_ratio = metrics['occupancy_ratio']
+                center_offset = metrics['normalized_offset']
+                center_offset_pixels = metrics['pixel_offset']
+
+                # self.observed_door_bboxes['door_bboxes'] and self.observed_door_bboxes['nones']
+                # we will use self.observed_door_bboxes['door_bboxes'] collection for keeping track of bbox metrics and
+                # analyzing new information. self.observed_door_bboxes['door_bboxes'] is a list of lists where each
+                # list represents one branch of bboxes (because we might have more than 1 bbox in an image) or in other
+                # words each branch represents one door. self.observed_door_bboxes['nones'] is a counter of how many
+                # None inputs we have received. If it's been more than 5, we may want to re-initialize because
+                # obviously we are no longer near a door.
+                #
+                # 1) Offset must be small to pass through. If it's big, then we're only passing by
+                # 2) Occ must be raising to something like 91-94% or more before it starts dropping and ends with nones
+                # 3) When occ starts dropping, offset can get large, it doesn't matter anymore
+                #
+                # We want to see a slow rise in occupancy followed by a slow fall while offset stays constantly low
+                observed_door_bboxes = self.observed_door_bboxes['door_bboxes']
+                observed_door_bboxes.append(metrics)
+                print("PASSOVER metrics: ", metrics)
+                if len(observed_door_bboxes) > STEPS_TO_LOOK_AT:
+                    # if we have more than 5, then trim from bottom
+                    observed_door_bboxes.pop(0)
+
+                if len(observed_door_bboxes) >= STEPS_TO_LOOK_AT:
+                    # always look at the last 5
+                    offset_uniformly_small = all([m['normalized_offset'] < 0.20 for m in observed_door_bboxes])
+                    # now find out if we have a slow rise and drop of high occupancies
+                    occupancy_always_high = all([m['occupancy_ratio'] > 0.85 for m in observed_door_bboxes])
+                    occupancies = [m['occupancy_ratio'] for m in observed_door_bboxes]
+                    peaks, _ = find_peaks(occupancies)
+                    only_one_peak = (len(peaks) == 1)
+
+                    walked_only_forward = all([act == 'MoveAhead' for act in self.current_active_action_gen.actions_taken[:STEPS_TO_LOOK_AT]])
+
+                    if only_one_peak and occupancy_always_high and offset_uniformly_small and walked_only_forward:
+                        print("PASSOVER DETECTED")
+                        passover_detected = True
+
+                # if len(observed_door_bboxes) < 1:
+                #     # If there is no current results, then create a new branch and store current result there
+                #     #observed_door_bboxes.append([occ_ratio])
+                #     observed_door_bboxes.append([metrics])
+                # else:
+                #     # if we already have something, then let's go through all branches and see where our new metric belongs
+                #     branch_found = False
+                #     print("PASSOVER metrics: ", metrics)
+                #     for door_branch in observed_door_bboxes:
+                #         last_occ = door_branch[-1]['occupancy_ratio']
+                #         last_co = door_branch[-1]['normalized_offset']
+                #         # only accept a reading if it's within 10% of previous reading and bigger than before
+                #         if (occ_ratio > last_occ
+                #                 and ((occ_ratio - last_occ) / last_occ) <= 0.05):
+                #             #door_branch.append(occ_ratio)
+                #             door_branch.append(metrics)
+                #             branch_found = True
+                #             # now analyze this branch and see if we can detect a passover
+                #             if (len(door_branch) >= 3 and occ_ratio > 0.96
+                #                 and (abs(center_offset - last_co) / last_co <= 0.05)
+                #                 and center_offset <= 0.05):
+                #                 passover_detected = True
+                #                 print("PASSOVER: ", door_branch)
+                #                 #self.reset_observed_door_bboxes()
+                #     if not branch_found:
+                #         # if no suitable branch was found, then create a new one
+                #         #observed_door_bboxes.append([occ_ratio])
+                #         observed_door_bboxes.append([metrics])
+        return passover_detected
 
     def add_door_in_current_transition_run(self, track_id, bbox, door_pic, whole_pic = None):
         """
@@ -465,16 +564,20 @@ class SemanticNavigationClient:
             # Take note of the track_id for each door- we'll use that to analyze different tracks and estimate
             # which track_id designates a specific sequence of the doors of interest (sequence of doors for the
             # current transition, for example).
+            door_bboxes = []
             for item in item_infos:
                 if item['name'] == 'OPENDOOR':
                     track_id = item['track_id']
                     bbox = item['bbox']
+                    door_bboxes.append(bbox)
                     door_only_pic = self.crop_bbox_from_pil(pil_image, bbox)
 
                     if track_id > -1:
                         self.add_door_in_current_transition_run(track_id, bbox, door_only_pic, pil_image)
+            self.detect_passing_through_door(door_bboxes)
         else:
             self.open_door_incidence_last10.append(False)
+            self.detect_passing_through_door(None)
             #print("AE: Adding door_track_ids: NONE")
 
         if len(self.open_door_incidence_last10) > 10:
@@ -801,9 +904,9 @@ class SemanticNavigationClient:
                         # if the door is good, but the view IS anchored, then we have detected a loop and want to break it -
                         # either now or after another occurence in which case we'll need the record ID from Vector DB.
                         self.register_anchor_id(anchor_id)
-                        print("ANCHOR ID: ", anchor_id, " len: ", self.anchor_ids[anchor_id])
+                        #print("ANCHOR ID: ", anchor_id, " len: ", self.anchor_ids[anchor_id])
                         if self.anchor_ids[anchor_id] > 1:
-                            print("AE: PER a loop was detected: ", metrics)
+                            #print("AE: PER a loop was detected: ", metrics)
                             # self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
                             # break
                             # TODO: we want to go out through the same door that we went in. For that we'll need to keep track
@@ -1252,7 +1355,8 @@ class SemanticNavigationClient:
         :return:
         """
         self.rc_action_gen.set_image_receiver(self.process_incoming_image_rc)
-        self.scene_navigator.set_action_gen(self.rc_action_gen)
+        self.current_active_action_gen = self.rc_action_gen
+        self.scene_navigator.set_action_gen(self.current_active_action_gen)
         self.current_active_SNP = SNPType.ROOM_CENTRE_FINDER
         print("AE: ROOM_CENTRE_FINDER started")
         self.scene_navigator.navigate_to_goal()
@@ -1268,7 +1372,8 @@ class SemanticNavigationClient:
         """
         self.dr_action_gen.set_image_receiver(self.process_incoming_image_dr)
         self.dr_action_gen.set_client_procedure_for_snp_reset(self.actions_to_do_when_snp_reset)
-        self.scene_navigator.set_action_gen(self.dr_action_gen)
+        self.current_active_action_gen = self.dr_action_gen
+        self.scene_navigator.set_action_gen(self.current_active_action_gen)
         self.current_active_SNP = SNPType.DOOR_FINDER
         print("AE: DOOR_FINDER started")
         self.scene_navigator.navigate_to_goal()
@@ -1284,7 +1389,8 @@ class SemanticNavigationClient:
         """
         self.prepare_for_PER_SNP()
         self.per_action_gen.set_image_receiver(self.process_incoming_image_per)
-        self.scene_navigator.set_action_gen(self.per_action_gen)
+        self.current_active_action_gen = self.per_action_gen
+        self.scene_navigator.set_action_gen(self.current_active_action_gen)
         self.current_active_SNP = SNPType.PERIMETER_WALKER
         print("AE: PERIMETER_WALKER started")
         self.scene_navigator.navigate_to_goal()
@@ -1297,7 +1403,8 @@ class SemanticNavigationClient:
         Just rotate in place (yaw) either left or right anything between 45 and 180 degrees.
         :return:
         """
-        self.scene_navigator.set_action_gen(self.rr_action_gen)
+        self.current_active_action_gen = self.rr_action_gen
+        self.scene_navigator.set_action_gen(self.current_active_action_gen)
         self.rr_action_gen.regen_actions()
         self.current_active_SNP = SNPType.RANDOM_ROTATOR
         self.scene_navigator.navigate_to_goal()
