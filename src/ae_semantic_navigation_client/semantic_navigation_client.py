@@ -132,7 +132,7 @@ class ActionGenerator:
             )
 
             # if we have a bbox to cover and we've already ran for at least 10 steps, then reset SNP (not interrupt)
-            if self.steps_after_reset >= 10:
+            if self.steps_after_reset >= 30:
                 self.reset()
         else:
             # Resize to 64 x 64
@@ -190,7 +190,14 @@ class ActionGenerator:
         #     self.reset()
         # else:
         #     next_move_str = index_to_action(response['action_bits']['action']) # <- this needs to talk to Jetson over ZMQ and pass it the image
-        next_move_str = index_to_action(response['action_bits']['action'])  # <- this needs to talk to Jetson over ZMQ and pass it the image
+        # if we've recently reset, then do nothing for 5 steps to avoid sporadic movement.
+        if self.steps_after_reset <= 15:
+            next_move_str = "PAUSE"
+            #print("AE: PAUSING AFTER RESET")
+        else:
+            next_move_str = index_to_action(response['action_bits']['action'])  # <- this needs to talk to Jetson over ZMQ and pass it the image
+
+        #next_move_str = index_to_action(response['action_bits']['action'])  # <- this needs to talk to Jetson over ZMQ and pass it the image
         self.actions_taken.append(next_move_str)
         #print("ACT: ", next_move_str)
         # along with the rest of the observation.
@@ -325,6 +332,7 @@ class SemanticNavigationClient:
         # when we start, we will start with RC SNP and we can assume that transition has happened - namely
         # from NOT_CLASSIFIED to whatever we are going to classify first.
         self.transition_likely_happened = True
+        self.per_SNP_broke_out_of_loop = False
 
     def reset_observed_door_bboxes(self):
         self.observed_door_bboxes = {'nones': 0, 'door_bboxes': []}
@@ -370,6 +378,7 @@ class SemanticNavigationClient:
 
     def prepare_for_PER_SNP(self):
         self.doors_in_current_room = dict()
+        self.per_SNP_broke_out_of_loop = False
 
     def detect_passing_through_door(self, new_bboxes):
         """
@@ -383,7 +392,7 @@ class SemanticNavigationClient:
             # before the door or maybe we went further past the door.
             self.observed_door_bboxes['nones'] += 1
             if self.observed_door_bboxes['nones'] > 4:
-                print("PASSOVER DETECTION RESET")
+                #print("PASSOVER DETECTION RESET")
                 self.reset_observed_door_bboxes()
         else:
             # we have at least one new bbox. Let's see how it tallies with the bboxes that we already have
@@ -408,7 +417,7 @@ class SemanticNavigationClient:
                 # We want to see a slow rise in occupancy followed by a slow fall while offset stays constantly low
                 observed_door_bboxes = self.observed_door_bboxes['door_bboxes']
                 observed_door_bboxes.append(metrics)
-                print("PASSOVER metrics: ", metrics)
+                #print("PASSOVER metrics: ", metrics)
                 if len(observed_door_bboxes) > STEPS_TO_LOOK_AT:
                     # if we have more than 5, then trim from bottom
                     observed_door_bboxes.pop(0)
@@ -425,7 +434,7 @@ class SemanticNavigationClient:
                     walked_only_forward = all([act == 'MoveAhead' for act in self.current_active_action_gen.actions_taken[:STEPS_TO_LOOK_AT]])
 
                     if only_one_peak and occupancy_always_high and offset_uniformly_small and walked_only_forward:
-                        print("PASSOVER DETECTED")
+                        #print("PASSOVER DETECTED")
                         passover_detected = True
 
                 # if len(observed_door_bboxes) < 1:
@@ -701,7 +710,7 @@ class SemanticNavigationClient:
         bboxes_to_cover = [di['bbox'] for di in doors_info if di['door_known']]
 
         # If we have only one door in this room, then don't cover any bboxes
-        if len(self.doors_in_current_room.keys()) < 2:
+        if len(self.doors_in_current_room.keys()) < 2 or self.per_SNP_broke_out_of_loop:
             bboxes_to_cover = None
 
         # If we have at least five doors in the recent history, then start querying if we know anything about them
@@ -802,7 +811,7 @@ class SemanticNavigationClient:
             #  instead of just door finder SNP alone. That should allow for discovery of other doors after we've reset
             #  the RSSM state with the is_first flag.
             #self.remedy_commands.append(self.go_to_room_centre)
-            self.remedy_commands.append(self.do_random_rotation)
+            #self.remedy_commands.append(self.do_random_rotation)
             self.remedy_commands.append(self.go_to_perimeter_of_room)
             self.remedy_commands.append(self.go_to_next_room)
             self.dr_action_gen.reset()
@@ -891,6 +900,7 @@ class SemanticNavigationClient:
         # has explored it.
         for di in doors_info: self.collect_door_in_this_room(di)
 
+        # TODO: If we see a door nearby, can we turn away from it?
         if len(all_door_bboxes) > 0:
             for bbox in all_door_bboxes:
                 door_is_near, occupancy, door_is_centered, metrics = self.check_door_proximity(bbox)
@@ -934,6 +944,7 @@ class SemanticNavigationClient:
                                         # so it wasn't a door leading back, but loop nonetheless. What should we do? Interrupt?
                                         # Perhaps let's interrupt if we've seen it third time already
                                         if self.anchor_ids[anchor_id] > 2:
+                                            self.per_SNP_broke_out_of_loop = True
                                             self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
                                             print("Interrupting because self.anchor_ids[anchor_id] = ", self.anchor_ids[anchor_id])
                                             break
@@ -943,6 +954,7 @@ class SemanticNavigationClient:
                                           self.last_dr_SNP_confirmed_room.name)
                                     # So not really a door that we know, but it was still a loop
                                     if self.anchor_ids[anchor_id] > 2:
+                                        self.per_SNP_broke_out_of_loop = True
                                         self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
                                         print("Interrupting because self.anchor_ids[anchor_id] = ", self.anchor_ids[anchor_id])
                                         break
@@ -950,6 +962,7 @@ class SemanticNavigationClient:
                                 # Such Image hasn't been embedded at all, but we do have a loop detected on an anchor. We probably
                                 # never switched on DR SNP for this room yet.
                                 if self.anchor_ids[anchor_id] > 2:
+                                    self.per_SNP_broke_out_of_loop = True
                                     self.scene_navigator.interrupt_navigation(self.callback_from_interrupted_snp)
                                     print("Door unknwon... Interrupting because self.anchor_ids[anchor_id] = ",
                                           self.anchor_ids[anchor_id])

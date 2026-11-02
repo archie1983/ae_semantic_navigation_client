@@ -5,7 +5,8 @@ from thortils.utils.math import sep_spatial_sample
 import thortils as tt
 import random, cv2
 from PIL import Image
-import numpy as np
+import copy
+import matplotlib.pyplot as plt
 
 ##
 # This class will use one or more of our neural network models and navigate through a scene
@@ -25,6 +26,12 @@ class SceneNavigator:
         # If we want to interrupt the work of current SNP, then we'll set this to True
         self.interrupt = False
         self.intrp_callback_function = None
+
+        # Matplotlib stuff
+        plt.ion()
+        self.fig = None
+        self.ax = None
+        self.im = None
 
     def process_required_habitats(self):
         self.process_habitat(10)
@@ -51,6 +58,62 @@ class SceneNavigator:
             self.rnc.reset_state()
             #self.rnc.set_controller(self.controller)
 
+    # def show_top_down_map(self):
+    #     grid_size = self.controller.initialization_parameters["gridSize"]
+    #
+    #     # reachable_positions = [
+    #     #     tuple(map(lambda x: roundany(x, grid_size), pos))
+    #     #     for pos in thor_reachable_positions(self.controller)]
+    #
+    #     x_max = max([pos[0] for pos in self.reachable_positions])
+    #     z_max = max([pos[1] for pos in self.reachable_positions])
+    #     x_min = min([pos[0] for pos in self.reachable_positions])
+    #     z_min = min([pos[1] for pos in self.reachable_positions])
+    #
+    #     fig, ax = plt.subplots()
+    #
+    #     # setting up for the top-down picture of the habitat
+    #     print(str(x_min-grid_size) + " " + str(x_max+grid_size) + " " + str(z_min-grid_size) + " " + str(z_max+grid_size))
+    #     img = self.get_top_down_frame()
+    #     ex_mul = 7
+    #     ax.imshow(img, extent=[x_min-ex_mul*grid_size, x_max+ex_mul*grid_size, z_min-ex_mul*grid_size, z_max+ex_mul*grid_size])
+    #
+    #     plt.show()
+    #     plt.close()
+
+    def show_top_down_map(self):
+        grid_size = self.controller.initialization_parameters["gridSize"]
+
+        x_max = max([pos[0] for pos in self.reachable_positions])
+        z_max = max([pos[1] for pos in self.reachable_positions])
+        x_min = min([pos[0] for pos in self.reachable_positions])
+        z_min = min([pos[1] for pos in self.reachable_positions])
+
+        ex_mul = 7
+        extent = [x_min - ex_mul * grid_size, x_max + ex_mul * grid_size,
+                  z_min - ex_mul * grid_size, z_max + ex_mul * grid_size]
+
+        # Create figure only ONCE
+        if self.fig is None:
+            self.fig, self.ax = plt.subplots(figsize=(8, 8))
+            img = self.get_top_down_frame()
+            self.im = self.ax.imshow(img, extent=extent)
+            self.ax.set_title("Top-Down View")
+            plt.tight_layout()
+            plt.show(block=False)  # Non-blocking show
+        else:
+            # Clear and redraw (or update existing artist)
+            self.ax.clear()
+            img = self.get_top_down_frame()
+            self.ax.imshow(img, extent=extent)
+
+            self.ax.set_title("Top-Down View")
+
+        # Draw and pause briefly to update
+        self.fig.canvas.draw_idle()
+        self.fig.canvas.flush_events()
+        plt.pause(0.001)  # Small pause to let GUI process events
+
     def generate_placements(self):
         ## All we need is a set of random positions and we get them like this:
         # params for the random teleportation part
@@ -68,8 +131,8 @@ class SceneNavigator:
         initial_agent_pose = tt.thor_agent_pose(self.controller)
         initial_horizon = tt.thor_camera_horizon(self.controller.last_event)
 
-        reachable_positions = tt.thor_reachable_positions(self.controller)
-        placements = sep_spatial_sample(reachable_positions, sep, num_stops,
+        self.reachable_positions = tt.thor_reachable_positions(self.controller)
+        placements = sep_spatial_sample(self.reachable_positions, sep, num_stops,
                                         rnd=self.rnd)
         self.placements = placements
         return placements
@@ -129,14 +192,17 @@ class SceneNavigator:
 
             if next_move_str == "STOP":
                 continue
-            elif next_move_str == "PAUSE":
+            elif next_move_str == "TURN":
                 for i in range(4):
                     self.rnc.execute_action("RotateRight", degrees=45, moveMagnitude=self.grid_size,
                                             grid_size=self.grid_size,
                                             adhere_to_grid=True)
+            elif next_move_str == "PAUSE":
+                continue
             else:
                 self.rnc.execute_action(next_move_str, degrees=45, moveMagnitude=self.grid_size, grid_size=self.grid_size,
                                         adhere_to_grid=True)
+                self.show_top_down_map()
 
         # If we had to interrupt, then reset the interupt and clean up action generator
         if self.interrupt:
@@ -148,6 +214,53 @@ class SceneNavigator:
     def interrupt_navigation(self, intrp_callback_function = None):
         self.interrupt = True
         self.intrp_callback_function = intrp_callback_function
+
+    ##
+    # For display purposes - the top down view of the habitat
+    ##
+    def get_top_down_frame(self):
+        # Setup the top-down camera
+        event = self.controller.step(action="GetMapViewCameraProperties", raise_for_failure=True)
+        pose = copy.deepcopy(event.metadata["actionReturn"])
+
+        bounds = event.metadata["sceneBounds"]["size"]
+        max_bound = max(bounds["x"], bounds["z"])
+
+        pose["fieldOfView"] = 50
+        pose["position"]["y"] += 1.1 * max_bound
+        pose["orthographic"] = False
+        pose["farClippingPlane"] = 50
+        del pose["orthographicSize"]
+
+        if not hasattr(self, 'has_top_down_camera'):
+            self.has_top_down_camera = False
+            self.top_down_camera_id = 0
+
+        if not self.has_top_down_camera:
+            #print("AE: Adding camera")
+            # add the camera to the scene
+            event = self.controller.step(
+                action="AddThirdPartyCamera",
+                **pose,
+                skyboxColor="white",
+                raise_for_failure=True,
+            )
+            self.top_down_camera_id = len(event.third_party_camera_frames) - 1
+            self.has_top_down_camera = True
+        else:
+            #print("AE: updating camera")
+            # If we already have a top-down view camera, then we need to update it to suit the current habitat
+            self.controller.step(
+                action="UpdateThirdPartyCamera",
+                thirdPartyCameraId=self.top_down_camera_id,
+                **pose,
+                #position=position,
+                #rotation=rotation
+            )
+
+        top_down_frame = event.third_party_camera_frames[self.top_down_camera_id]
+
+        return Image.fromarray(top_down_frame)
 
 class TestActionGenerator:
     def __init__(self):
